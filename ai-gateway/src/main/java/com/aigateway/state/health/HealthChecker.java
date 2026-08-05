@@ -3,10 +3,14 @@ package com.aigateway.state.health;
 import com.aigateway.core.domain.model.ModelInstance;
 import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.state.registry.ModelRegistry;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Component;
-import org.springframework.web.reactive.function.client.WebClient;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -15,7 +19,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 健康检查：定时探活 + 状态快照。
+ * 健康检查：定时探活（阻塞式探针）+ 状态快照。
  *
  * 🖊 手敲 H4：状态转换逻辑（mark / isHealthy）尚未实现，
  * 请按《版本1-详细实施计划》第 13 节补全（见下方 TODO）。
@@ -25,16 +29,19 @@ public class HealthChecker {
 
     private final GatewayProperties props;
     private final ModelRegistry registry;
-    private final WebClient webClient;
+    private final HttpClient httpClient;
+    private final ObjectMapper objectMapper;
 
     private final Map<String, Integer> consecutiveFailures = new ConcurrentHashMap<>();
     private final Map<String, Boolean> healthy = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    public HealthChecker(GatewayProperties props, ModelRegistry registry, WebClient webClient) {
+    public HealthChecker(GatewayProperties props, ModelRegistry registry,
+                         HttpClient httpClient, ObjectMapper objectMapper) {
         this.props = props;
         this.registry = registry;
-        this.webClient = webClient;
+        this.httpClient = httpClient;
+        this.objectMapper = objectMapper;
     }
 
     @PostConstruct
@@ -52,15 +59,27 @@ public class HealthChecker {
 
     private void checkOne(String channelId) {
         registry.findChannel(channelId).ifPresent(ch ->
-                webClient.get()
-                        .uri(ch.baseUrl() + "/health")
-                        .retrieve()
-                        .bodyToMono(Map.class)
-                        .timeout(Duration.ofMillis(props.getHealth().getTimeoutMs()))
-                        .subscribe(
-                                body -> mark(channelId, "UP".equals(body.get("status"))),
-                                err -> mark(channelId, false)
-                        ));
+                mark(channelId, probe(ch.baseUrl())));
+    }
+
+    /** 阻塞式探活：GET /health，200 且 status=UP 视为健康。 */
+    private boolean probe(String baseUrl) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/health"))
+                    .timeout(Duration.ofMillis(props.getHealth().getTimeoutMs()))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = httpClient.send(request,
+                    HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                return false;
+            }
+            Map<?, ?> body = objectMapper.readValue(response.body(), Map.class);
+            return "UP".equals(body.get("status"));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ============================================================

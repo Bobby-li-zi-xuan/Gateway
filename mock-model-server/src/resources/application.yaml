@@ -7,6 +7,9 @@ mock:
 spring:
   main:
     banner-mode: off
+  threads:
+    virtual:
+      enabled: true
 
 logging:
   level:

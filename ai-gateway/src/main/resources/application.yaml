@@ -1,15 +1,18 @@
 server:
   port: 8080
 
-logging:
-  level:
-    com.aigateway: DEBUG
-  pattern: "[Gateway %d{HH:mm:ss}] %msg%n"
-
 spring:
   config:
     import:
       - classpath:model.yml
+  threads:
+    virtual:
+      enabled: true
+
+logging:
+  level:
+    com.aigateway: DEBUG
+  pattern: "[Gateway %d{HH:mm:ss}] %msg%n"
 
 management:
   endpoints:

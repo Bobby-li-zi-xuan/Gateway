@@ -1,4 +1,4 @@
-# AI Gateway & Inference Scheduler — 完整项目设计文档 v3.0
+﻿# AI Gateway & Inference Scheduler — 完整项目设计文档 v3.0
 
 > 本文档在 v2.0 基础上，系统吸收 LiteLLM、New API（One API）、Portkey、Higress、Kong、APISIX、Envoy AI Gateway 等主流开源 AI 网关的设计优点，重构并完善整体设计。
 > **本文档为唯一权威设计文档**，v2.0 及以下版本的设计描述以本文档为准。
@@ -21,7 +21,7 @@
 
 | 维度 | LiteLLM | New API | 本项目 |
 |---|---|---|---|
-| 定位 | LLM 代理 / 网关（Python+Rust） | 渠道分发与计费平台（Go） | 状态驱动的智能调度网关（Java/WebFlux） |
+| 定位 | LLM 代理 / 网关（Python+Rust） | 渠道分发与计费平台（Go） | 状态驱动的智能调度网关（Java 21 / Spring MVC + 虚拟线程） |
 | 路由方式 | 负载均衡 + 路由插件信号 | 渠道加权随机 + 失败重试 | 多目标打分（延迟/成本/质量/健康）+ 策略引擎 + 插件信号 |
 | 治理重点 | 预算、Guardrail、日志 | 令牌、额度、计费、控制台 | 渠道/令牌/配额/成本闭环 + 智能调度 |
 | 独特能力 | Provider 适配最广 | 计费生态最完整 | 决策与执行分离、状态闭环驱动的推理调度 |
@@ -233,8 +233,8 @@ score(instance) = w1 * norm(latency) + w2 * norm(cost) + w3 * norm(quality) + w4
 
 ```java
 public interface Connector {
-    Flux<ChatCompletionChunk> stream(ChatRequest request, Channel channel);
-    Mono<ChatCompletion> complete(ChatRequest request, Channel channel);
+    void stream(ChatRequest request, Channel channel, Consumer<ChatCompletionChunk> consumer);
+    ChatCompletion complete(ChatRequest request, Channel channel);
 }
 ```
 
