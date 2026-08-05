@@ -1,0 +1,14 @@
+server:
+  port: ${SERVER_PORT:8002}
+
+mock:
+  model: ${MOCK_MODEL:qwen-small}
+
+spring:
+  main:
+    banner-mode: off
+
+logging:
+  level:
+    com.aigateway: INFO
+  pattern: "[Mock %d{HH:mm:ss}] %msg%n"

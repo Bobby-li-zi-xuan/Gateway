@@ -1,0 +1,51 @@
+gateway:
+  health:
+    intervalSeconds: 5
+    timeoutMs: 2000
+    consecutiveFailures: 3
+  channels:
+    - id: mock-a
+      provider: openai-compatible
+      baseUrl: http://localhost:8001
+      credentialsRef: ""          # 空表示无需密钥（mock）；真实上游写 env:OPENAI_API_KEY
+      weight: 10
+    - id: mock-b
+      provider: openai-compatible
+      baseUrl: http://localhost:8002
+      credentialsRef: ""
+      weight: 5
+  models:
+    - alias: qwen
+      candidates:
+        - channelId: mock-a
+          model: qwen-large
+          weight: 8
+          capability:
+            contextLength: 128000
+            multimodal: false
+            toolCallSupport: true
+            codingAbility: MEDIUM
+            reasoningLevel: HIGH
+            qualityLevel: QUALITY_HIGH
+        - channelId: mock-b
+          model: qwen-small
+          weight: 2
+          capability:
+            contextLength: 32000
+            multimodal: false
+            toolCallSupport: false
+            codingAbility: LOW
+            reasoningLevel: LOW
+            qualityLevel: FAST
+    - alias: deepseek-code
+      candidates:
+        - channelId: mock-b
+          model: deepseek-code
+          weight: 1
+          capability:
+            contextLength: 64000
+            multimodal: false
+            toolCallSupport: true
+            codingAbility: MAX
+            reasoningLevel: MEDIUM
+            qualityLevel: QUALITY_MEDIUM
