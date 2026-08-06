@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "minDiffLines": 10,
+  "rateLimitMinutes": 15,
+  "timeoutSec": 600,
+  "retries": 3,
+  "retryBackoffSec": [10, 60],
+  "cacheTtlHours": 24,
+  "maxDiffChars": 80000,
+  "maxContextChars": 30000,
+  "model": "",
+  "promptVersion": 1,
+  "skipCommitMarkers": ["[review:skip]", "wip", "draft"],
+  "skipPatterns": ["docs/", "*.md", "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", ".gitignore", ".vscode/", ".github/", "assets/", "dist/"],
+  "promptReminderMinutes": 10
+}
