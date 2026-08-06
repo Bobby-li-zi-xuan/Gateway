@@ -6,7 +6,6 @@ import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.service.ChatGatewayService;
 import com.aigateway.infra.web.RequestIdFilter;
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -15,6 +14,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -22,7 +22,9 @@ import java.util.UUID;
  *
  * 职责：
  * 1. 接收客户端请求，统一生成 requestId 贯穿全链路；
- * 2. 根据 stream 参数分流：非流式直接返回完整 JSON；流式返回 SSE（Server-Sent Events）。
+ * 2. 根据 stream 参数分流：非流式直接返回完整 JSON；流式返回 SSE（Server-Sent Events）；
+ * 3. V2：提取关键 header 为 metadata（tenant / canary_group），供示例插件消费
+ *    （TODO H6：决策引擎接入后，把 metadata 传入 ChatGatewayService）。
  *
  * 流式实现要点：
  * - {@link SseEmitter} 是 Spring MVC 的异步响应对象，会自动把 send() 的内容按
@@ -46,9 +48,10 @@ public class ChatCompletionController {
      * @param httpRequest 用于取出 RequestIdFilter 写入的 requestId
      */
     @PostMapping("/v1/chat/completions")
-    public ResponseEntity<?> chat(@RequestBody ChatRequest request, HttpServletRequest httpRequest) {
+    public Object chat(@RequestBody ChatRequest request, HttpServletRequest httpRequest) {
         // 先取链路 ID：没有过滤器注入时（例如直接调用）再临时生成一个
         String requestId = requestId(httpRequest);
+        // TODO H6：接入决策引擎后，把 metadata(httpRequest) 传入 gatewayService.complete/stream
         // 流式与非流式走两条完全不同的响应路径
         if (request.streaming()) {
             return streamResponse(request, requestId);
@@ -59,12 +62,17 @@ public class ChatCompletionController {
     }
 
     /**
-     * 流式响应：把响应体换成 SseEmitter，并立刻返回 HTTP 200 + text/event-stream。
+     * 流式响应：返回 SseEmitter，并立刻返回 HTTP 200 + text/event-stream。
      *
-     * 注意：控制器方法返回后，Tomcat 会挂起该连接；真正的数据由下面的虚拟线程
-     * 逐步写入 emitter，写完调用 complete() 结束，异常则 completeWithError() 断开。
+     * 注意：
+     * - 必须“裸返回” SseEmitter，不能包在 ResponseEntity 里——Spring MVC 对
+     *   ResponseEntity 走 HttpMessageConverter 路径，不支持 SseEmitter，
+     *   裸返回才会被 SseEmitterReturnValueHandler 接管（计划文档 S9 的示例写错了，
+     *   这里按正确行为实现）；
+     * - 控制器方法返回后，Tomcat 会挂起该连接；真正的数据由下面的虚拟线程
+     *   逐步写入 emitter，写完调用 complete() 结束，异常则 completeWithError() 断开。
      */
-    private ResponseEntity<SseEmitter> streamResponse(ChatRequest request, String requestId) {
+    private SseEmitter streamResponse(ChatRequest request, String requestId) {
         // 0L 表示不设超时：流式连接时长由上游决定，不能按普通请求的读超时处理
         SseEmitter emitter = new SseEmitter(0L);
         // 每个流式请求一个虚拟线程，命名带上 requestId 方便排查
@@ -87,10 +95,23 @@ public class ChatCompletionController {
                 emitter.completeWithError(e);
             }
         });
-        // 以 SSE 媒体类型返回 emitter，Spring 接管后续异步写响应
-        return ResponseEntity.ok()
-                .contentType(MediaType.TEXT_EVENT_STREAM)
-                .body(emitter);
+        // 裸返回 SseEmitter：Spring 自动按 data: 帧格式输出并设好 media type
+        return emitter;
+    }
+
+    /**
+     * V2：把关键 header 提取成 metadata（示例插件消费）。
+     * TODO H6：决策引擎接入后，把该 map 传入 gatewayService.complete/stream。
+     */
+    private Map<String, String> metadata(HttpServletRequest httpRequest) {
+        return Map.of(
+                "tenant", header(httpRequest, "X-Tenant-Id", "default"),
+                "canary_group", header(httpRequest, "X-Canary-Group", "stable"));
+    }
+
+    private String header(HttpServletRequest req, String name, String fallback) {
+        String value = req.getHeader(name);
+        return value == null || value.isBlank() ? fallback : value;
     }
 
     /**

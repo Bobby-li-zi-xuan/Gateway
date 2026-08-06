@@ -10,7 +10,9 @@ import lombok.AllArgsConstructor;
  * 学习要点：
  * - V1 只把它当作展示/预留数据（model.yml 里配置、启动时随实例加载），
  *   真正按能力做调度（如代码题优先选 codingAbility=MAX）属于 V2 决策引擎的范畴；
- * - 能力值是约定字符串而非枚举，便于配置自由扩展，但代价是少了编译期检查。
+ * - 能力值是约定字符串而非枚举，便于配置自由扩展，但代价是少了编译期检查；
+ * - V2 新增 {@code streaming}：能力过滤（CapabilityFilter）用它判断实例是否支持流式，
+ *   缺省 true（OpenAI 兼容实例默认支持 SSE）。
  */
 @Data
 @NoArgsConstructor
@@ -23,4 +25,5 @@ public class Capability {
     private String codingAbility;     // 编码能力：LOW / MEDIUM / HIGH / MAX
     private String reasoningLevel;    // 推理深度：LOW / MEDIUM / HIGH
     private String qualityLevel;      // 输出质量档位：QUALITY_HIGH / QUALITY_MEDIUM / FAST
+    private boolean streaming = true; // V2：是否支持流式（SSE），缺省 true
 }

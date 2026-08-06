@@ -7,11 +7,15 @@ import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.infra.config.SecretResolver;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * 模型注册中心：维护“别名 → 候选实例列表”与渠道表。
@@ -22,11 +26,13 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * 数据结构：
  * - byAlias：alias → 候选实例列表（路由查询入口）；
- * - channels：channelId → 渠道信息（baseUrl / 鉴权 / 权重）。
+ * - channels：channelId → 渠道信息（baseUrl / 鉴权 / 权重）；
+ * - strategyByAlias：alias → 策略名（V2 PolicyManager 交叉校验与运行时查询用）。
  *
  * 学习要点：
  * - {@link ConcurrentHashMap} 保证并发安全（虽然 V1 启动后基本只读）；
- * - 对外返回 {@link List#copyOf} 不可变列表，防止调用方意外修改内部状态。
+ * - 对外返回 {@link List#copyOf} 不可变列表，防止调用方意外修改内部状态；
+ * - V2 新字段（价格/质量/延迟）缺省时在此处填默认值，保证旧配置可启动。
  */
 @Component
 public class ModelRegistry {
@@ -36,6 +42,9 @@ public class ModelRegistry {
 
     /** 渠道 ID → 渠道信息 */
     private final Map<String, Channel> channels = new ConcurrentHashMap<>();
+
+    /** 别名 → 策略名（V2：缺省 balanced） */
+    private final Map<String, String> strategyByAlias = new ConcurrentHashMap<>();
 
     private final SecretResolver secretResolver;
 
@@ -55,6 +64,11 @@ public class ModelRegistry {
      * 3) 重复 alias 应拒绝
      * 校验失败统一抛 GatewayException(500, "invalid_config", 可读信息)
      * ============================================================
+     * V2 增量（脚手架已完成）：
+     * 4) 候选新字段：priceIn/priceOut >= 0；qualityScore 若配置必须在 0~1；
+     *    latencyProfileMs 若配置必须 > 0
+     * 5) qualityScore 缺省由 qualityLevel 推导；latencyProfileMs 缺省 1000
+     * 6) 记录 alias → strategy（缺省 balanced）
      */
     private void init(GatewayProperties props) {
         // 1. 渠道：先解析密钥引用（只做校验、不保存值），缺失即启动失败
@@ -65,15 +79,26 @@ public class ModelRegistry {
                     def.getCredentialsRef(), def.getWeight()));
         }
 
-        // 2. 模型候选：逐条校验 alias / 候选 / 渠道 / 权重
+        // 2. 模型候选：逐条校验 alias / 候选 / 渠道 / 权重 / 重复 alias / 新字段
+        Set<String> seenAliases = new HashSet<>();
         for (GatewayProperties.ModelDef def : props.getModels()) {
             if (def.getAlias() == null || def.getAlias().isBlank()) {
                 throw new GatewayException(500, "invalid_config", "models 中存在空 alias");
+            }
+            // 重复 alias 会让后配置的静默覆盖先配置的，客户端路由结果不可预期，必须拒绝
+            if (!seenAliases.add(def.getAlias())) {
+                throw new GatewayException(500, "invalid_config",
+                        "重复的 alias: " + def.getAlias());
             }
             if (def.getCandidates().isEmpty()) {
                 throw new GatewayException(500, "invalid_config",
                         "alias[" + def.getAlias() + "] 没有任何候选");
             }
+            // V2：记录别名引用的策略名（PolicyManager 启动时交叉校验）
+            strategyByAlias.put(def.getAlias(),
+                    def.getStrategy() == null || def.getStrategy().isBlank()
+                            ? "balanced" : def.getStrategy());
+
             List<ModelInstance> instances = def.getCandidates().stream().map(c -> {
                 Channel channel = channels.get(c.getChannelId());
                 // 候选引用的渠道必须已配置
@@ -86,11 +111,29 @@ public class ModelRegistry {
                     throw new GatewayException(500, "invalid_config",
                             "alias[" + def.getAlias() + "] 存在非正权重");
                 }
+                // V2：价格/质量/延迟画像校验（尽早失败）
+                if (c.getPriceIn() < 0 || c.getPriceOut() < 0) {
+                    throw new GatewayException(500, "invalid_config",
+                            "alias[" + def.getAlias() + "] 存在负价格");
+                }
+                if (c.getQualityScore() != null
+                        && (c.getQualityScore() < 0 || c.getQualityScore() > 1)) {
+                    throw new GatewayException(500, "invalid_config",
+                            "alias[" + def.getAlias() + "] 的 qualityScore 必须在 0~1");
+                }
+                if (c.getLatencyProfileMs() != null && c.getLatencyProfileMs() <= 0) {
+                    throw new GatewayException(500, "invalid_config",
+                            "alias[" + def.getAlias() + "] 的 latencyProfileMs 必须 > 0");
+                }
                 // instanceId = channelId:model，同一渠道下不同模型互不冲突
                 return new ModelInstance(
                         c.getChannelId() + ":" + c.getModel(),
                         def.getAlias(), c.getChannelId(), c.getModel(),
-                        c.getWeight(), c.getCapability());
+                        c.getWeight(), c.getCapability(),
+                        c.getPriceIn(), c.getPriceOut(),
+                        c.getQualityScore() != null ? c.getQualityScore()
+                                : deriveQuality(c.getCapability()),
+                        c.getLatencyProfileMs() != null ? c.getLatencyProfileMs() : 1000L);
             }).toList();
             byAlias.put(def.getAlias(), List.copyOf(instances));
         }
@@ -106,9 +149,16 @@ public class ModelRegistry {
         return byAlias.getOrDefault(alias, List.of());
     }
 
-    /** 所有候选实例（跨别名去重后的完整列表，健康检查遍历用） */
+    /** 所有候选实例（跨别名按 instanceId 去重后的完整列表，健康检查遍历用） */
     public List<ModelInstance> findAll() {
-        return byAlias.values().stream().flatMap(List::stream).toList();
+        // 同一渠道+模型可能出现在多个别名下（如 deepseek-code 同时被两个别名引用），
+        // 健康检查按渠道去重并不受影响，但这里仍按 instanceId 去重，保证返回列表无重复
+        return byAlias.values().stream()
+                .flatMap(List::stream)
+                .collect(Collectors.toMap(ModelInstance::instanceId, Function.identity(),
+                        (a, b) -> a, LinkedHashMap::new))
+                .values().stream()
+                .toList();
     }
 
     /** 按渠道 ID 查渠道信息；不存在返回空 */
@@ -119,5 +169,23 @@ public class ModelRegistry {
     /** 所有模型别名（GET /v1/models 用），返回不可变副本 */
     public List<String> aliases() {
         return List.copyOf(byAlias.keySet());
+    }
+
+    /** V2：别名 → 策略名（缺省 balanced；PolicyManager 启动校验与运行时查询用） */
+    public String strategyOf(String alias) {
+        return strategyByAlias.getOrDefault(alias, "balanced");
+    }
+
+    /** V2：qualityScore 缺省时从能力画像的质量档位推导（未配置能力 → 0.5） */
+    private static double deriveQuality(com.aigateway.core.domain.model.Capability capability) {
+        if (capability == null || capability.getQualityLevel() == null) {
+            return 0.5;
+        }
+        return switch (capability.getQualityLevel()) {
+            case "QUALITY_HIGH" -> 0.9;
+            case "QUALITY_MEDIUM" -> 0.6;
+            case "FAST" -> 0.3;
+            default -> 0.5;
+        };
     }
 }

@@ -1,0 +1,12 @@
+# 集成测试专用配置：优先级高于 src/main/resources/application.yaml（test-classes 在 classpath 前）。
+# 网关跑在 18003，两个 mock 固定 18001/18002（见 model.yml）。
+server:
+  port: 18003
+
+spring:
+  config:
+    import:
+      - classpath:model.yml
+  threads:
+    virtual:
+      enabled: true

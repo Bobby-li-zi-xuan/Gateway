@@ -1,11 +1,13 @@
 package com.aigateway.observability;
 
+import com.aigateway.decision.model.RoutingDecision;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
 
 /**
- * 基础指标（V1）：请求成功/失败计数、流式 chunk 计数。
+ * 基础指标：请求成功/失败计数、流式 chunk 计数（V1）；
+ * 决策分布与过滤淘汰计数（V2）。
  * 通过 /actuator/prometheus 暴露（Prometheus 文本格式）。
  *
  * 学习要点：
@@ -36,6 +38,21 @@ public class GatewayMetrics {
     /** 流式模式下每转发一个 chunk 计数一次，可观察生成速率 */
     public void streamChunk(String alias, String instanceId) {
         counter("gateway.stream.chunks", alias, instanceId, "").increment();
+    }
+
+    /** V2：决策分布 gateway_decisions_total{model,strategy}（对应设计文档 11.1） */
+    public void decision(RoutingDecision decision) {
+        counter("gateway.decisions.total", decision.alias(), decision.strategy(), "")
+                .increment();
+    }
+
+    /** V2：过滤淘汰计数 gateway_filter_drops_total{model,filter} */
+    public void filterDrops(String alias, String filter, int dropped) {
+        Counter.builder("gateway.filter.drops")
+                .tag("model", alias)
+                .tag("filter", filter)
+                .register(meterRegistry)
+                .increment(dropped);
     }
 
     /** 构建（或复用）一个带固定标签的计数器；重复调用 register 会自动复用同名指标 */
