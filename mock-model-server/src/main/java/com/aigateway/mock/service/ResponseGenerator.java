@@ -7,10 +7,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
+/**
+ * Mock 响应生成器：按模型风格生成差异化内容，并模拟延迟与故障。
+ *
+ * 学习要点：
+ * - 每种 responseStyle（CODE / ANALYSIS / CHAT）有若干条预置模板，随机返回一条，
+ *   让不同 mock 实例的输出“看起来像”不同模型；
+ * - 延迟/故障概率来自 ModelProfile（可通过 /mock/behavior 动态调整）。
+ */
 @Component
 public class ResponseGenerator {
+
     private final Random random = new Random();
 
+    /** 预置响应模板：key = responseStyle，value = 可随机选择的回复列表 */
     private static final Map<String, List<String>> STYLE_RESPONSES = Map.of(
         "CODE", List.of(
             "```java\npublic class Solution {\n    // 这里是代码实现\n    public static void main(String[] args) {\n        System.out.println(\"Hello\");\n    }\n}\n```\n以上是代码实现。",
@@ -26,28 +36,34 @@ public class ResponseGenerator {
         )
     );
 
-    /*
-    根据模型风格生成差异化响应内容，默认为CHAT
-    @return 从预定义的响应模板中随机返回一条回复
+    /**
+     * 根据模型风格生成差异化响应内容，默认使用 CHAT 风格。
+     *
+     * @param profile 当前模型画像（含 responseStyle）
+     * @return 从预定义模板中随机返回一条回复
      */
-    public String generate(ModelProfile profile){
+    public String generate(ModelProfile profile) {
+        // 找不到对应风格时回退到 CHAT，保证任何配置都能出内容
         List<String> candidates = STYLE_RESPONSES.
         getOrDefault(profile.responseStyle(), STYLE_RESPONSES.get("CHAT"));
         return candidates.get(random.nextInt(candidates.size()));
     }
 
-    /*
-    模拟 tokens/s 的生成速率，计算返回该content的模拟延迟
-    */
-    public long simulateLatency(ModelProfile profile, String content){
+    /**
+     * 模拟 tokens/s 的生成速率：在基础延迟上叠加随机波动，
+     * 返回该 content 的模拟延迟（毫秒）。
+     */
+    public long simulateLatency(ModelProfile profile, String content) {
+        // 波动范围 [0, baseLatency/2)，让每次请求延迟不同、更像真实服务
         long variableDelay = random.nextLong(profile.baseLatencyMs() / 2);
         return profile.baseLatencyMs() + variableDelay;
     }
 
-    /*
-    判断本次请求是否应该模拟失败
-    */
-    public boolean shouldFail(ModelProfile profile){
+    /**
+     * 判断本次请求是否应该模拟失败。
+     * errorRate=0.0 永不失败；1.0 永远失败（故障注入演示用）。
+     */
+    public boolean shouldFail(ModelProfile profile) {
         return random.nextDouble() < profile.errorRate();
     }
 }
