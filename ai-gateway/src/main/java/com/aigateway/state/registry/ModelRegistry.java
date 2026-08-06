@@ -2,6 +2,7 @@ package com.aigateway.state.registry;
 
 import com.aigateway.core.domain.model.Channel;
 import com.aigateway.core.domain.model.ModelInstance;
+import com.aigateway.core.exception.GatewayException;
 import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.infra.config.SecretResolver;
 import org.springframework.stereotype.Component;
@@ -39,23 +40,43 @@ public class ModelRegistry {
         // 校验失败统一抛 GatewayException(500, "invalid_config", 可读信息)
         // 参考实现：见《版本1-详细实施计划》第 7.3 节 S5b
         // ============================================================
-
+        
+        // 1.渠道：解析密钥引用（缺失即启动失败）
         for (GatewayProperties.ChannelDef def : props.getChannels()) {
+            secretResolver.resolve(def.getCredentialsRef());
             channels.put(def.getId(), new Channel(
                     def.getId(), def.getProvider(), def.getBaseUrl(),
                     def.getCredentialsRef(), def.getWeight()));
         }
 
+        // 2.模型候选：校验渠道存在、权重合法
         for (GatewayProperties.ModelDef def : props.getModels()) {
-            List<ModelInstance> instances = new ArrayList<>();
-            for (GatewayProperties.CandidateDef c : def.getCandidates()) {
+            if (def.getAlias() == null || def.getAlias().isBlank()) {
+                throw new GatewayException(500, "invalid_config", "models 中存在空 alias");
+            }
+            if (def.getCandidates().isEmpty()) {
+                throw new GatewayException(500, "invalid_config",
+                        "alias[" + def.getAlias() + "] 没有任何候选");
+            }
+            List<ModelInstance> instances = def.getCandidates().stream().map(c -> {
                 Channel channel = channels.get(c.getChannelId());
-                instances.add(new ModelInstance(
+                if (channel == null) {
+                    throw new GatewayException(500, "invalid_config",
+                            "alias[" + def.getAlias() + "] 引用了不存在的渠道: " + c.getChannelId());
+                }
+                if (c.getWeight() <= 0) {
+                    throw new GatewayException(500, "invalid_config",
+                            "alias[" + def.getAlias() + "] 存在非正权重");
+                }
+                return new ModelInstance(
                         c.getChannelId() + ":" + c.getModel(),
                         def.getAlias(), c.getChannelId(), c.getModel(),
-                        c.getWeight(), c.getCapability()));
-            }
+                        c.getWeight(), c.getCapability());
+            }).toList();
             byAlias.put(def.getAlias(), List.copyOf(instances));
+        }
+        if (byAlias.isEmpty()) {
+            throw new GatewayException(500, "invalid_config", "未配置任何模型");
         }
     }
 
