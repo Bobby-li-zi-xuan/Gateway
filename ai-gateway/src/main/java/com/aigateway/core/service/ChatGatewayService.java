@@ -157,67 +157,69 @@ public class ChatGatewayService {
     }
 
     /**
- * 流式入口：与 V1 相同的安全边界——首字节前失败才可切换；已经开始输出则直接中断。
- *
- * 为什么有这个边界（对照 V1 设计要点）：流式一旦发出第一个 chunk，客户端就收到了部分内容，
- * 此时重试会让客户端看到重复/错位的内容（不可安全重放），所以宁可 502 中断。
- * 区别：降级目标从 decision.fallbackChain() 取（V1 是剩余候选重新加权随机）。
- */
-public void stream(ChatRequest request, String requestId, Map<String, String> metadata,
-                   Consumer<ChatChunk> consumer) {
+     * 流式入口：与 V1 相同的安全边界——首字节前失败才可切换；已经开始输出则直接中断。
+     *
+     * 为什么有这个边界（对照 V1 设计要点）：流式一旦发出第一个 chunk，客户端就收到了部分内容，
+     * 此时重试会让客户端看到重复/错位的内容（不可安全重放），所以宁可 502 中断。
+     * 区别：降级目标从 decision.fallbackChain() 取（V1 是剩余候选重新加权随机）。
+     */
+    public void stream(ChatRequest request, String requestId, Map<String, String> metadata,
+                       Consumer<ChatChunk> consumer) {
         DecisionOutcome outcome = decisionEngine.decide(request, requestId, metadata);
         decisionLogStore.record(outcome.decision());
         RoutingDecision decision = outcome.decision();
 
-        // started 用单元素数组；lambda里要修改外部变量， Java要求它“最终有效”
-        // 数组元素不是变量本身，所以可以修改
+        // started 用单元素数组：lambda 里要修改外部变量，Java 要求它“有效最终”，
+        // 数组元素不是变量本身，所以可以修改（学习点：lambda 捕获）
         boolean[] started = {false};
         long start = System.nanoTime();
         ModelInstance primary = decision.primary();
         stateStore.beginRequest(primary.instanceId());
-        try{
+        try {
             connector.stream(primary, request, chunk -> {
-                if(!started[0]){
+                if (!started[0]) {
                     started[0] = true;
+                    // 流式样本：用首字节延迟记录成功（V3 再细化完成态）
                     stateStore.recordSuccess(primary.instanceId(), elapsedMs(start));
                 }
                 metrics.streamChunk(request.model(), primary.instanceId());
-                consumer.accept((chunk));
-        });
-    }catch(Exception e){
-        if(started[0]){
-                // 首个token已经输出，此时出错直接中断 502
+                consumer.accept(chunk);   // chunk 转给上层 Controller 写入 SseEmitter
+            });
+        } catch (Exception e) {
+            if (started[0]) {
+                // 已输出内容不可重放：直接 502（安全边界）
                 notifyError(outcome, e);
                 throw new GatewayException(502, "upstream_failed",
-                    "流式输出中断: " + e.getMessage(), e);
+                        "流式输出中断: " + e.getMessage(), e);
             }
-            // 首字节前失败： 记录失败样本后尝试降级
+            // 首字节前失败：记录失败样本后尝试降级
             stateStore.recordFailure(primary.instanceId());
             metrics.failure(request.model(), primary.instanceId());
-            if(!decision.fallbackChain().isEmpty()){
+            if (!decision.fallbackChain().isEmpty()) {
                 ModelInstance backup = decision.fallbackChain().get(0);
                 log(requestId, "流式降级(首字节前)",
-                    primary.instanceId() + " -> " + backup.instanceId());
+                        primary.instanceId() + " -> " + backup.instanceId());
                 stateStore.beginRequest(backup.instanceId());
-                try{
-                    // 降级成功：直接复用consumer转发
+                try {
+                    // 降级成功：直接复用 consumer 转发；与非流式同口径记成功指标（审查 #1）
                     connector.stream(backup, request, consumer);
-                    return ;
-                }catch(Exception e2){
-                    // 主选与降级均失败 -> 502 + 计数 + ON_ERROR
+                    metrics.success(request.model(), backup.instanceId());
+                    return;
+                } catch (Exception e2) {
+                    // 与非流式一致的语义：主选与降级均失败 → 502 + 计数 + ON_ERROR
                     stateStore.recordFailure(backup.instanceId());
                     metrics.failure(request.model(), backup.instanceId());
                     notifyError(outcome, e2);
                     throw new GatewayException(502, "upstream_failed",
-                        "主选与降级候选均失败: " + e2.getMessage(), e2);
-                }finally {
-                stateStore.endRequest(backup.instanceId());
+                            "主选与降级候选均失败: " + e2.getMessage(), e2);
+                } finally {
+                    stateStore.endRequest(backup.instanceId());
                 }
-        }
-        notifyError(outcome, e);   // 无降级可试：ON_ERROR → 502
-        throw new GatewayException(502, "upstream_failed",
-                "主选候选失败且无降级候选: " + e.getMessage(), e);
-        }finally {
+            }
+            notifyError(outcome, e);   // 无降级可试：ON_ERROR → 502
+            throw new GatewayException(502, "upstream_failed",
+                    "主选候选失败且无降级候选: " + e.getMessage(), e);
+        } finally {
             stateStore.endRequest(primary.instanceId());   // 主选的并发计数无论成败都释放
         }
     }
