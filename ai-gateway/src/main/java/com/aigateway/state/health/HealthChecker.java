@@ -27,9 +27,6 @@ import java.util.concurrent.TimeUnit;
  * - 探活结果交给 {@link #mark} 更新“连续失败次数 + 健康快照”；
  * - 路由线程只读 {@link #isHealthy} 的内存快照，请求路径零阻塞。
  *
- * 🖊 手敲 H4：状态转换逻辑（mark / isHealthy）尚未实现，
- * 请按《版本1-详细实施计划》第 13 节补全（见下方 TODO）。
- *
  * 学习要点：
  * - {@link ConcurrentHashMap} 保证“定时线程写、路由线程读”之间的可见性；
  * - 状态粒度是渠道（V1），路由按渠道过滤；
@@ -107,23 +104,25 @@ public class HealthChecker {
         }
     }
 
-    // ============================================================
-    // TODO H4（手敲）：状态转换
-    // mark(channelId, up)：
-    //   - up   → 连续失败计数清零，healthy[channelId] = true
-    //   - !up  → 连续失败 +1；达到 props.getHealth().getConsecutiveFailures() 才置 false
-    // isHealthy(channelId)：
-    //   - 读 healthy 快照，默认 true（首次探活前放行）
-    // 学习提示：为什么“连续失败达到阈值才置 false”？
-    //   避免单次网络抖动就把渠道踢出路由；阈值给了服务恢复的缓冲。
-    // ============================================================
+    /**
+     * 状态转换（已实现，H4）：
+     * - up   → 连续失败计数清零，healthy[channelId] = true；
+     * - !up  → 连续失败 +1；达到阈值才置 false（给服务恢复留缓冲，避免单次抖动误杀）。
+     */
     private void mark(String channelId, boolean up) {
-        throw new UnsupportedOperationException(
-                "H4 未实现：请手敲 mark() 状态转换逻辑（见详细实施计划第 13 节）");
+        if(up){
+            consecutiveFailures.put(channelId, 0);
+            healthy.put(channelId, true);
+        }else{
+            int fails = consecutiveFailures.merge(channelId, 1, Integer::sum);
+            if(fails >= props.getHealth().getConsecutiveFailures()){
+                healthy.put(channelId, false);
+            }
+        }
     }
 
+    /** 路由调用：读内存快照，零阻塞；首次探活前默认放行 */
     public boolean isHealthy(String channelId) {
-        throw new UnsupportedOperationException(
-                "H4 未实现：请手敲 isHealthy() 快照读取（见详细实施计划第 13 节）");
+        return healthy.getOrDefault(channelId, true);
     }
 }

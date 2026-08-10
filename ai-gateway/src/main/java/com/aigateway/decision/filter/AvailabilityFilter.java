@@ -23,7 +23,7 @@ public class AvailabilityFilter implements CandidateFilter {
     }
 
     public int order() {
-        return 20;
+        return 40;
     }
 
     public String name() {

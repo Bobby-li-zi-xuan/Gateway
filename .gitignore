@@ -11,6 +11,8 @@ target/
 .vscode/
 *.swp
 *.swo
+.codex/
+.claude/
 
 # OS
 .DS_Store
@@ -18,3 +20,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+
+

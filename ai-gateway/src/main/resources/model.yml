@@ -1,8 +1,23 @@
+# 网关配置（V2 完整结构，对照《版本2-详细实施计划》第 5.1 节）
+#
+# V1 结构（health / channels / models）保留；V2 新增：
+# - gateway.decision：决策引擎参数（决策日志容量 / EWMA 系数 / 默认输出 token）
+# - models[].strategy：引用 gateway.policies 里的策略模板
+# - 候选的价格 / 质量 / 延迟画像（Scorer 打分输入）
+# - gateway.policies：策略模板（MULTI_OBJECTIVE / WEIGHTED_RANDOM / CONDITIONAL）
+# - gateway.plugins：插件挂载（按 name 匹配 SPI 实例）
 gateway:
   health:
     intervalSeconds: 5
     timeoutMs: 2000
     consecutiveFailures: 3
+
+  decision:
+    logSize: 100
+    ewmaAlpha: 0.3
+    errorRateAlpha: 0.1
+    defaultOutputTokens: 256
+
   channels:
     - id: mock-a
       provider: openai-compatible
@@ -14,12 +29,18 @@ gateway:
       baseUrl: http://localhost:8002
       credentialsRef: ""
       weight: 5
+
   models:
     - alias: qwen
+      strategy: simple-task        # 引用 gateway.policies 里的模板名
       candidates:
         - channelId: mock-a
           model: qwen-large
           weight: 8
+          priceIn: 0.001           # 每 1K input tokens 价格（美元），成本打分输入
+          priceOut: 0.002          # 每 1K output tokens 价格
+          qualityScore: 0.9        # 0~1 静态质量分
+          latencyProfileMs: 2000   # EWMA 初始延迟，与实际 mock 延迟一致
           capability:
             contextLength: 128000
             multimodal: false
@@ -30,6 +51,10 @@ gateway:
         - channelId: mock-b
           model: qwen-small
           weight: 2
+          priceIn: 0.01
+          priceOut: 0.02
+          qualityScore: 0.4
+          latencyProfileMs: 200
           capability:
             contextLength: 32000
             multimodal: false
@@ -38,10 +63,15 @@ gateway:
             reasoningLevel: LOW
             qualityLevel: FAST
     - alias: deepseek-code
+      strategy: quality-first
       candidates:
         - channelId: mock-b
           model: deepseek-code
           weight: 1
+          priceIn: 0.002
+          priceOut: 0.004
+          qualityScore: 0.8
+          latencyProfileMs: 500
           capability:
             contextLength: 64000
             multimodal: false
@@ -49,3 +79,48 @@ gateway:
             codingAbility: MAX
             reasoningLevel: MEDIUM
             qualityLevel: QUALITY_MEDIUM
+
+  policies:
+    - name: balanced
+      type: MULTI_OBJECTIVE
+      weights: { latency: 0.25, cost: 0.25, quality: 0.25, health: 0.25 }
+    - name: latency-first
+      type: MULTI_OBJECTIVE
+      weights: { latency: 0.6, cost: 0.1, quality: 0.15, health: 0.15 }
+    - name: cost-first
+      type: MULTI_OBJECTIVE
+      weights: { latency: 0.1, cost: 0.6, quality: 0.2, health: 0.1 }
+    - name: quality-first
+      type: MULTI_OBJECTIVE
+      weights: { latency: 0.15, cost: 0.1, quality: 0.6, health: 0.15 }
+    - name: simple-task
+      type: CONDITIONAL
+      defaultStrategy: balanced   # 规则未命中时回退到该策略（必须是 MULTI_OBJECTIVE）
+      rules:
+        - when:
+            signal: task_complexity
+            op: EQ
+            value: COMPLEX
+          select:                 # 命中选择的候选（必须是该别名候选的子集）
+            - channelId: mock-a
+              model: qwen-large
+
+  plugins:
+    - name: complexity-recognizer
+      scope: GLOBAL
+      order: 30
+      config:
+        keywordRegex: "代码|算法|重构|设计"
+    - name: canary
+      scope: ROUTE
+      scopeValue: qwen            # ROUTE 作用域：只对 alias=qwen 生效
+      order: 20
+      config:
+        stableInstances: [ "mock-a:qwen-large" ]
+        canaryInstances: [ "mock-b:qwen-small" ]
+        # 无 enabled 开关：演示 B 禁用金丝雀 = 注释掉本挂载项（见实施计划 21.4）
+    - name: clear-candidates      # 仅演示 fail-closed 用，默认关闭
+      scope: GLOBAL
+      order: 10
+      config:
+        enabled: false

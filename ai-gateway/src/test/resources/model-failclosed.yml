@@ -1,0 +1,10 @@
+# 场景 C（fail-closed）专用：与 model.yml 组合加载（import 顺序后者覆盖前者），
+# 仅替换 gateway.plugins 整段——clear-candidates 以 enabled=true 挂载，
+# 用于演示"插件清空候选池 → 503 candidates_cleared"。
+gateway:
+  plugins:
+    - name: clear-candidates
+      scope: GLOBAL
+      order: 10
+      config:
+        enabled: true

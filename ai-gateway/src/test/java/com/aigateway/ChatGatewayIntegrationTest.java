@@ -87,13 +87,18 @@ class ChatGatewayIntegrationTest {
     }
 
     private static HttpResponse<String> post(String url, String body) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
+        return post(url, body, Map.of());
+    }
+
+    private static HttpResponse<String> post(String url, String body, Map<String, String> headers)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .timeout(Duration.ofSeconds(30))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
-        return client.send(request, HttpResponse.BodyHandlers.ofString());
+                .POST(HttpRequest.BodyPublishers.ofString(body));
+        headers.forEach(builder::header);
+        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private static HttpResponse<InputStream> postStream(String url, String body)
@@ -196,6 +201,84 @@ class ChatGatewayIntegrationTest {
             }
         } finally {
             post(mockBUrl + "/mock/behavior", "{\"health\":true}"); // 恢复，避免影响其它用例
+        }
+    }
+
+    // ============ V2 场景（计划 20.2）============
+
+    private static final String COMPLEX_BODY = "{\"model\":\"qwen\","
+            + "\"messages\":[{\"role\":\"user\",\"content\":\"请写一段 Java 代码实现快速排序\"}]}";
+
+    @Test
+    void complexRequest_shouldHitConditionalRouteToQwenLarge() throws Exception {
+        // 场景 A-1：插件零侵入生效——复杂度识别插件写 COMPLEX 信号，
+        // simple-task 条件策略命中 → 只选 mock-a:qwen-large
+        HttpResponse<String> resp = post(gatewayUrl + "/v1/chat/completions", COMPLEX_BODY);
+
+        assertThat(resp.statusCode()).isEqualTo(200);
+        Map<?, ?> body = JSON.readValue(resp.body(), Map.class);
+        assertThat(body.get("model")).isEqualTo("qwen-large");
+    }
+
+    @Test
+    void experimentalGroup_shouldRouteToQwenSmall() throws Exception {
+        // 场景 A-2：金丝雀分组——experimental 组白名单只含 mock-b:qwen-small
+        HttpResponse<String> resp = post(gatewayUrl + "/v1/chat/completions", CHAT_BODY,
+                Map.of("X-Canary-Group", "experimental"));
+
+        assertThat(resp.statusCode()).isEqualTo(200);
+        Map<?, ?> body = JSON.readValue(resp.body(), Map.class);
+        assertThat(body.get("model")).isEqualTo("qwen-small");
+    }
+
+    @Test
+    void debugEndpoint_shouldReturnCompleteScoringDetails() throws Exception {
+        // 场景 B：可解释路由——普通请求（回退 balanced 多目标）后，
+        // /v1/debug/decisions 返回的打分明细结构完整
+        HttpResponse<String> chat = post(gatewayUrl + "/v1/chat/completions", CHAT_BODY);
+        assertThat(chat.statusCode()).isEqualTo(200);
+
+        HttpResponse<String> debug = get(gatewayUrl + "/v1/debug/decisions?limit=5");
+        assertThat(debug.statusCode()).isEqualTo(200);
+        Map<?, ?> body = JSON.readValue(debug.body(), Map.class);
+        assertThat((Integer) body.get("count")).isGreaterThan(0);
+
+        List<?> decisions = (List<?>) body.get("decisions");
+        Map<?, ?> first = (Map<?, ?>) decisions.get(0);
+        assertThat(first.get("scoringDetails")).asList().isNotEmpty();
+        for (Object item : (List<?>) first.get("scoringDetails")) {
+            Map<?, ?> d = (Map<?, ?>) item;
+            // 明细字段齐全：instanceId / raw / normalized / weights / finalScore
+            assertThat(d.get("instanceId")).isNotNull();
+            assertThat(d.get("raw")).isInstanceOf(Map.class);
+            assertThat(d.get("normalized")).isInstanceOf(Map.class);
+            assertThat(d.get("weights")).isInstanceOf(Map.class);
+            assertThat(d.get("finalScore")).isInstanceOf(Number.class);
+        }
+    }
+
+    @Test
+    void clearCandidatesPlugin_shouldReturn503CandidatesCleared() throws Exception {
+        // 场景 C：fail-closed——独立网关实例（端口 18004），spring.config.import 组合加载
+        // model.yml + model-failclosed.yml（后者整体替换 plugins 段，clear-candidates enabled=true）。
+        // 注：不用 --gateway.plugins[2].config.enabled=true 覆盖——Spring Boot 对 list 的
+        // indexed property 不支持与 yaml 合并（"elements were left unbound"）。
+        ConfigurableApplicationContext failClosedGateway = null;
+        try {
+            failClosedGateway = new SpringApplicationBuilder(TestGatewayApplication.class)
+                    .web(WebApplicationType.SERVLET)
+                    .run("--server.port=18004",
+                            "--spring.config.import=classpath:model.yml,classpath:model-failclosed.yml");
+            HttpResponse<String> resp = post(
+                    "http://localhost:18004/v1/chat/completions", CHAT_BODY);
+
+            assertThat(resp.statusCode()).isEqualTo(503);
+            Map<?, ?> body = JSON.readValue(resp.body(), Map.class);
+            assertThat(body.get("type")).isEqualTo("candidates_cleared");
+        } finally {
+            if (failClosedGateway != null) {
+                failClosedGateway.close();
+            }
         }
     }
 }

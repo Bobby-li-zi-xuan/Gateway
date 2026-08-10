@@ -12,7 +12,8 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * 加权随机策略（Codex 脚手架）：复用版本 1 的转盘算法。
+ * 候选之间"不分优劣"或"想按比例试探"，需要把流量摊开
+ * 加权随机策略：转盘算法。
  * 主选 = 加权随机结果；降级链 = 其余候选按 weight 降序（V3 使用）。
  */
 @Component

@@ -23,8 +23,7 @@ import java.util.UUID;
  * 职责：
  * 1. 接收客户端请求，统一生成 requestId 贯穿全链路；
  * 2. 根据 stream 参数分流：非流式直接返回完整 JSON；流式返回 SSE（Server-Sent Events）；
- * 3. V2：提取关键 header 为 metadata（tenant / canary_group），供示例插件消费
- *    （TODO H6：决策引擎接入后，把 metadata 传入 ChatGatewayService）。
+ * 3. V2：提取关键 header 为 metadata（tenant / canary_group），传入网关服务供示例插件消费。
  *
  * 流式实现要点：
  * - {@link SseEmitter} 是 Spring MVC 的异步响应对象，会自动把 send() 的内容按
@@ -51,13 +50,12 @@ public class ChatCompletionController {
     public Object chat(@RequestBody ChatRequest request, HttpServletRequest httpRequest) {
         // 先取链路 ID：没有过滤器注入时（例如直接调用）再临时生成一个
         String requestId = requestId(httpRequest);
-        // TODO H6：接入决策引擎后，把 metadata(httpRequest) 传入 gatewayService.complete/stream
         // 流式与非流式走两条完全不同的响应路径
         if (request.streaming()) {
-            return streamResponse(request, requestId);
+            return streamResponse(request, requestId, metadata(httpRequest));
         }
         // 非流式：阻塞等待上游返回完整结果（虚拟线程保证不占满系统线程）
-        ChatCompletion completion = gatewayService.complete(request, requestId);
+        ChatCompletion completion = gatewayService.complete(request, requestId, metadata(httpRequest));
         return ResponseEntity.ok(completion);
     }
 
@@ -72,14 +70,15 @@ public class ChatCompletionController {
      * - 控制器方法返回后，Tomcat 会挂起该连接；真正的数据由下面的虚拟线程
      *   逐步写入 emitter，写完调用 complete() 结束，异常则 completeWithError() 断开。
      */
-    private SseEmitter streamResponse(ChatRequest request, String requestId) {
+    private SseEmitter streamResponse(ChatRequest request, String requestId,
+                                      Map<String, String> metadata) {
         // 0L 表示不设超时：流式连接时长由上游决定，不能按普通请求的读超时处理
         SseEmitter emitter = new SseEmitter(0L);
         // 每个流式请求一个虚拟线程，命名带上 requestId 方便排查
         Thread.ofVirtual().name("sse-" + requestId).start(() -> {
             try {
                 // gatewayService.stream 会阻塞读取上游 SSE 并逐 chunk 回调
-                gatewayService.stream(request, requestId, chunk -> {
+                gatewayService.stream(request, requestId, metadata, chunk -> {
                     try {
                         // 一个 chunk 就是 OpenAI 格式的一段增量（{choices:[{delta:{content}}]}）
                         emitter.send(chunk);
@@ -100,8 +99,7 @@ public class ChatCompletionController {
     }
 
     /**
-     * V2：把关键 header 提取成 metadata（示例插件消费）。
-     * TODO H6：决策引擎接入后，把该 map 传入 gatewayService.complete/stream。
+     * V2：把关键 header 提取成 metadata（示例插件消费），传入 gatewayService.complete/stream。
      */
     private Map<String, String> metadata(HttpServletRequest httpRequest) {
         return Map.of(

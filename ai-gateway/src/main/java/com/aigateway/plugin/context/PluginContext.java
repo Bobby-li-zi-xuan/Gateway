@@ -2,6 +2,7 @@ package com.aigateway.plugin.context;
 
 import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.domain.model.ModelInstance;
+import com.aigateway.core.exception.GatewayException;
 import com.aigateway.decision.model.RoutingDecision;
 
 import java.util.ArrayList;
@@ -51,8 +52,12 @@ public class PluginContext {
     /** 候选集合（可变）：插件只允许移除，不允许新增 */
     public List<ModelInstance> candidates() { return candidates; }
 
-    /** 整体替换候选（Filter Chain 用）；引擎会在决策前校验非空 */
+    /** 整体替换候选（Filter Chain 用）；只允许收窄——新集合必须是当前候选的子集 */
     public void setCandidates(List<ModelInstance> narrowed) {
+        if (!candidates.containsAll(narrowed)) {
+            throw new GatewayException(500, "internal_error",
+                    "candidates 只允许收窄：新候选集合包含原集合之外的实例");
+        }
         candidates.clear();
         candidates.addAll(narrowed);
     }

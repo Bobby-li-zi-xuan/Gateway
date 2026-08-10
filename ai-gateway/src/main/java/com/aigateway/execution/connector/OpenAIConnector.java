@@ -29,7 +29,7 @@ import java.util.function.Consumer;
  * 职责：把网关内部请求转成 HTTP 调用发给上游渠道，再把上游响应转回类型化 DTO。
  * 两种模式：
  * - {@link #complete}：非流式，一次性等待完整 JSON 响应（已实现）；
- * - {@link #stream} + {@link #parseSseLine}：流式，逐行读取上游 SSE 并回调转发（🖊 H3 手敲）。
+ * - {@link #stream} + {@link #parseSseLine}：流式，逐行读取上游 SSE 并回调转发（已实现，H3）。
  *
  * 学习要点：
  * - 使用 JDK 自带 HttpClient，不引入额外依赖；阻塞式调用由虚拟线程承载；
@@ -94,35 +94,79 @@ public class OpenAIConnector {
     }
 
     /**
-     * 流式调用。
+     * 流式调用（已实现，H3）。
      *
-     * 🖊 TODO H3（手敲）：按《版本1-详细实施计划》第 10 节实现：
-     * 1) HttpRequest POST channelBaseUrl(instance) + "/v1/chat/completions"
-     *    header Accept: text/event-stream，body 为 request.withStream(true) 的 JSON
-     * 2) httpClient.send(..., BodyHandlers.ofInputStream())，非 2xx 抛 GatewayException(502, ...)
-     * 3) 用 BufferedReader 逐行读取，parseSseLine(line) 非 null 时 consumer.accept(chunk)
-     * 4) IOException/InterruptedException → GatewayException(502, "upstream_failed", ...)
+     * 流程：构建 Accept: text/event-stream 的请求 → 用 InputStream 接收 →
+     *       BufferedReader 逐行读取 → parseSseLine 解析 → consumer 逐 chunk 转发。
      *
-     * 实现提示（学习）：
-     * - 流式的关键是一次只读一行并立刻转发，不要等整个响应读完（否则失去流式意义）；
+     * 学习要点：
+     * - 一次只读一行并立刻转发，不要等整个响应读完（否则失去流式意义）；
      * - 结束标志是 data: [DONE]，由 parseSseLine 返回 null 表示“本行忽略”。
      */
     public void stream(ModelInstance instance, ChatRequest request, Consumer<ChatChunk> consumer) {
-        throw new UnsupportedOperationException(
-                "H3 未实现：请手敲 stream()（见详细实施计划第 10 节）");
+        // 1. 构建流式请求：Accept: text/event-stream；body 强制 stream=true
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(channelBaseUrl(instance) + "/v1/chat/completions"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.ofString(writeJson(request.withStream(true))));
+        applyAuth(builder, instance);
+        try{
+            // 2. 用InputStream接收；不把整个响应体读进内存，边读边转发
+            HttpResponse<InputStream> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+
+            // 3. 非2xx，InputStream需要手动读完错误体再抛异常
+            if(response.statusCode() / 100 != 2){
+                String body = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
+                throw new GatewayException(502, "upstream_error", "上游返回 " 
+                    + response.statusCode() + ": " + body
+                );
+            }
+
+            // 4. 逐行读取SSE：一行一行解析转发，不攒批
+            try(BufferedReader reader = new BufferedReader(
+                new InputStreamReader(response.body(), StandardCharsets.UTF_8)
+            )){
+                String line;
+                while((line = reader.readLine()) != null){
+                    ChatChunk chunk = parseSseLine(line);
+                    if(chunk != null){
+                        consumer.accept(chunk);
+                    }
+                }
+            }
+        }catch(GatewayException e){
+            throw e;
+        }catch(IOException | InterruptedException e){
+            Thread.currentThread().interrupt();
+            throw new GatewayException(502, "upstream_failed", "流式调用上游失败：" + e.getMessage(), e);
+        }
     }
 
     /**
-     * SSE 行解析。
+     * SSE 行解析（已实现，H3）。
      *
-     * 🖊 TODO H3（手敲）：按《版本1-详细实施计划》第 10 节实现：
+     * 规则：
      * - "data: {...}" → objectMapper.readValue(payload, ChatChunk.class)
      * - "data: [DONE]" 或非 data 行 → 返回 null（忽略该行）
      * - JSON 解析失败 → GatewayException(502, "bad_upstream_sse", ...)
      */
     private ChatChunk parseSseLine(String line) {
-        throw new UnsupportedOperationException(
-                "H3 未实现：请手敲 parseSseLine()（见详细实施计划第 10 节）");
+        String trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) {
+            return null; // 忽略注释 / 心跳等非数据行
+        }
+        String payload = trimmed.substring(5).trim(); // 去掉 "data:" 前缀
+        if ("[DONE]".equals(payload)) {
+            return null; // 流结束标记：调用方据此结束循环
+        }
+        try {
+            return objectMapper.readValue(payload, ChatChunk.class);
+        } catch (IOException e) {
+            throw new GatewayException(502, "bad_upstream_sse",
+                    "上游返回了无法解析的 SSE 数据: " + payload);
+        }
     }
 
     /**

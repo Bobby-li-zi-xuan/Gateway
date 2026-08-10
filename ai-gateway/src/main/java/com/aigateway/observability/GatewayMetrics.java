@@ -5,6 +5,9 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * 基础指标：请求成功/失败计数、流式 chunk 计数（V1）；
  * 决策分布与过滤淘汰计数（V2）。
@@ -20,6 +23,8 @@ import org.springframework.stereotype.Component;
 public class GatewayMetrics {
 
     private final MeterRegistry meterRegistry;
+    /** filterDrops 的 Counter 缓存：避免每次调用重建 Builder（Micrometer 会复用同名 meter，缓存仅省去重复构建开销） */
+    private final Map<String, Counter> filterDropCounters = new ConcurrentHashMap<>();
 
     public GatewayMetrics(MeterRegistry meterRegistry) {
         this.meterRegistry = meterRegistry;
@@ -48,10 +53,11 @@ public class GatewayMetrics {
 
     /** V2：过滤淘汰计数 gateway_filter_drops_total{model,filter} */
     public void filterDrops(String alias, String filter, int dropped) {
-        Counter.builder("gateway.filter.drops")
-                .tag("model", alias)
-                .tag("filter", filter)
-                .register(meterRegistry)
+        filterDropCounters.computeIfAbsent(alias + "|" + filter, k ->
+                        Counter.builder("gateway.filter.drops")
+                                .tag("model", alias)
+                                .tag("filter", filter)
+                                .register(meterRegistry))
                 .increment(dropped);
     }
 

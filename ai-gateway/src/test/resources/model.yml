@@ -1,10 +1,23 @@
 # 集成测试专用模型配置：渠道指向测试 mock 的固定端口 18001/18002。
 # 健康检查参数压缩为 1 秒/1 次，加快剔除验证，避免测试等 15 秒。
+#
+# V2 结构（对照实施计划 5.1）：
+# - qwen 走 simple-task 条件策略：复杂请求命中 → 只选 mock-a；普通请求回退 balanced；
+# - 插件链：complexity-recognizer（写 task_complexity）、canary（金丝雀分组，
+#   stable 白名单 = 全量候选 → 不改变 V1 回归场景行为）、clear-candidates（默认关闭）；
+# - 场景 C（fail-closed）用独立网关实例以 property 覆盖 clear-candidates 的 enabled=true。
 gateway:
+  decision:
+    logSize: 100
+    ewmaAlpha: 0.3
+    errorRateAlpha: 0.1
+    defaultOutputTokens: 256
+
   health:
     intervalSeconds: 1
     timeoutMs: 2000
     consecutiveFailures: 1
+
   channels:
     - id: mock-a
       provider: openai-compatible
@@ -16,17 +29,86 @@ gateway:
       baseUrl: http://localhost:18002
       credentialsRef: ""
       weight: 5
+
+  policies:
+    - name: simple-task
+      type: CONDITIONAL
+      defaultStrategy: balanced
+      rules:
+        - when:
+            signal: task_complexity
+            op: EQ
+            value: COMPLEX
+          select:
+            - channelId: mock-a
+              model: qwen-large
+
+  plugins:
+    - name: complexity-recognizer
+      scope: GLOBAL
+      order: 30
+      config:
+        keywordRegex: "代码|算法|重构|设计"
+    - name: canary
+      scope: ROUTE
+      scopeValue: qwen
+      order: 20
+      config:
+        # stable 白名单 = 全量候选：无金丝雀 header 的请求（V1 回归场景）不受收窄影响
+        stableInstances: [ "mock-a:qwen-large", "mock-b:qwen-small" ]
+        canaryInstances: [ "mock-b:qwen-small" ]
+    - name: clear-candidates
+      scope: GLOBAL
+      order: 10
+      config:
+        enabled: false
+
   models:
     - alias: qwen
+      strategy: simple-task
       candidates:
         - channelId: mock-a
           model: qwen-large
           weight: 8
+          priceIn: 0.001
+          priceOut: 0.002
+          qualityScore: 0.9
+          latencyProfileMs: 2000
+          capability:
+            contextLength: 128000
+            multimodal: false
+            toolCallSupport: true
+            codingAbility: MEDIUM
+            reasoningLevel: HIGH
+            qualityLevel: QUALITY_HIGH
         - channelId: mock-b
           model: qwen-small
           weight: 2
+          priceIn: 0.01
+          priceOut: 0.02
+          qualityScore: 0.4
+          latencyProfileMs: 200
+          capability:
+            contextLength: 32000
+            multimodal: false
+            toolCallSupport: false
+            codingAbility: LOW
+            reasoningLevel: LOW
+            qualityLevel: FAST
     - alias: deepseek-code
+      strategy: quality-first
       candidates:
         - channelId: mock-b
           model: deepseek-code
           weight: 1
+          priceIn: 0.002
+          priceOut: 0.004
+          qualityScore: 0.8
+          latencyProfileMs: 500
+          capability:
+            contextLength: 64000
+            multimodal: false
+            toolCallSupport: true
+            codingAbility: MAX
+            reasoningLevel: MEDIUM
+            qualityLevel: QUALITY_MEDIUM

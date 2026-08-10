@@ -23,7 +23,7 @@ public class ClearCandidatesTestPlugin implements GatewayPlugin {
     }
 
     public int order() {
-        return 99;
+        return 10;
     }
 
     public void configure(Map<String, Object> config) {

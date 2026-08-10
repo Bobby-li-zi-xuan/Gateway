@@ -15,8 +15,9 @@ public interface CandidateFilter {
     /** 过滤器名（日志/指标维度） */
     String name();
 
-    /** 执行顺序（小 → 大） */
+    /** 执行顺序（数字大的先执行） */
     int order();
 
+    /** 对候选集做一次收窄：返回新列表（只允许移除，不允许新增） */
     List<ModelInstance> apply(ChatRequest request, PluginContext ctx, List<ModelInstance> candidates);
 }

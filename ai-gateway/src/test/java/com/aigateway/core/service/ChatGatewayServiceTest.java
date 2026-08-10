@@ -4,36 +4,48 @@ import com.aigateway.api.dto.ChatCompletion;
 import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.domain.model.ModelInstance;
 import com.aigateway.core.exception.GatewayException;
+import com.aigateway.decision.engine.DecisionEngine;
+import com.aigateway.decision.engine.DecisionEngine.DecisionOutcome;
+import com.aigateway.decision.log.DecisionLogStore;
+import com.aigateway.decision.model.RoutingDecision;
+import com.aigateway.decision.state.ModelStateStore;
 import com.aigateway.execution.connector.OpenAIConnector;
 import com.aigateway.observability.GatewayMetrics;
-import com.aigateway.state.health.HealthChecker;
-import com.aigateway.state.registry.ModelRegistry;
+import com.aigateway.plugin.context.PluginContext;
+import com.aigateway.plugin.engine.PluginEngine;
+import com.aigateway.plugin.spi.PluginPhase;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 网关主流程单测（计划第 16.1 节）：路由 + 失败切换 + 健康过滤。
+ * 网关主流程单测（计划 20.1，H6）：决策与执行分离后的执行层语义。
  *
- * 覆盖：第一候选失败 → 第二候选成功；全部失败 → 502；健康过滤 → 503。
+ * 覆盖：主选失败 → fallbackChain[0]；全失败 → 502；决策失败 → 503 且不落决策日志；
+ * 成功路径触发 AFTER_EXECUTION 钩子。
  */
 class ChatGatewayServiceTest {
 
-    private final ModelRegistry registry = mock(ModelRegistry.class);
-    private final HealthChecker healthChecker = mock(HealthChecker.class);
+    private final DecisionEngine decisionEngine = mock(DecisionEngine.class);
+    private final DecisionLogStore decisionLogStore = mock(DecisionLogStore.class);
     private final OpenAIConnector connector = mock(OpenAIConnector.class);
+    private final ModelStateStore stateStore = mock(ModelStateStore.class);
     private final GatewayMetrics metrics = mock(GatewayMetrics.class);
+    private final PluginEngine pluginEngine = mock(PluginEngine.class);
     private ChatGatewayService service;
 
     private static final ChatCompletion COMPLETION = new ChatCompletion(
@@ -42,15 +54,16 @@ class ChatGatewayServiceTest {
                     new ChatCompletion.Choice.Message("assistant", "ok"), "stop")),
             new ChatCompletion.Usage(1, 1, 2));
 
+    private static final Map<String, String> METADATA = Map.of("canary_group", "stable");
+
     @BeforeEach
     void setUp() {
-        service = new ChatGatewayService(registry, healthChecker, connector, metrics);
-        when(healthChecker.isHealthy(anyString())).thenReturn(true);
+        service = new ChatGatewayService(decisionEngine, decisionLogStore,
+                connector, stateStore, metrics, pluginEngine);
     }
 
     private ModelInstance instance(String id) {
-        // V2 ModelInstance 新增价格/质量/延迟画像字段，测试用默认值
-        return new ModelInstance(id, "qwen", "mock", "model", 1, null,
+        return new ModelInstance(id, "qwen", "mock", id.split(":")[1], 1, null,
                 0.0, 0.0, 0.5, 1000L);
     }
 
@@ -59,11 +72,24 @@ class ChatGatewayServiceTest {
                 false, null, null);
     }
 
+    private DecisionOutcome outcome(RoutingDecision decision) {
+        PluginContext ctx = new PluginContext(request(), "req-1", "qwen",
+                METADATA, decision.fallbackChain().isEmpty()
+                        ? List.of(decision.primary())
+                        : List.of(decision.primary(), decision.fallbackChain().get(0)));
+        return new DecisionOutcome(decision, ctx);
+    }
+
+    private RoutingDecision decision(List<ModelInstance> fallbackChain) {
+        return new RoutingDecision("req-1", "qwen", "balanced",
+                instance("mock-a:qwen-large"), fallbackChain,
+                List.of(), Map.of(), null);
+    }
+
     @Test
-    void firstCandidateFails_shouldFallbackToSecond() {
-        // 候选 A、B 都健康；第一次调用必失败、第二次必成功（候选顺序随机，故不断言具体 instance）
-        when(registry.findByAlias("qwen")).thenReturn(List.of(instance("mock-a:qwen-large"),
-                instance("mock-b:qwen-small")));
+    void primaryFails_shouldFallbackToChainHead() {
+        RoutingDecision decision = decision(List.of(instance("mock-b:qwen-small")));
+        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
         AtomicInteger calls = new AtomicInteger();
         when(connector.complete(any(), any())).thenAnswer(inv -> {
             if (calls.getAndIncrement() == 0) {
@@ -72,54 +98,78 @@ class ChatGatewayServiceTest {
             return COMPLETION;
         });
 
-        ChatCompletion result = service.complete(request(), "req-1");
+        ChatCompletion result = service.complete(request(), "req-1", METADATA);
 
         assertThat(result).isEqualTo(COMPLETION);
-        verify(metrics).failure(anyString(), anyString()); // 一次失败
-        verify(metrics).success(anyString(), anyString()); // 一次成功
+        verify(decisionLogStore).record(decision);              // 决策明细先落库
+        verify(metrics).failure("qwen", "mock-a:qwen-large");   // 主选失败计数
+        verify(metrics).success("qwen", "mock-b:qwen-small");   // 降级成功计数
+        // 执行阶段钩子：BEFORE_EXECUTION（主选前）+ AFTER_EXECUTION（降级成功后）
+        verify(pluginEngine).runPhase(eq(PluginPhase.BEFORE_EXECUTION), any(PluginContext.class));
+        verify(pluginEngine).runPhase(eq(PluginPhase.AFTER_EXECUTION), any(PluginContext.class));
     }
 
     @Test
-    void allCandidatesFail_shouldReturn502() {
-        when(registry.findByAlias("qwen")).thenReturn(List.of(instance("mock-a:qwen-large"),
-                instance("mock-b:qwen-small")));
+    void primaryAndBackupFail_shouldReturn502() {
+        RoutingDecision decision = decision(List.of(instance("mock-b:qwen-small")));
+        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
         when(connector.complete(any(), any())).thenThrow(new RuntimeException("boom"));
 
-        assertThatThrownBy(() -> service.complete(request(), "req-1"))
+        assertThatThrownBy(() -> service.complete(request(), "req-1", METADATA))
                 .isInstanceOf(GatewayException.class)
                 .satisfies(e -> {
                     assertThat(((GatewayException) e).getStatus()).isEqualTo(502);
                     assertThat(((GatewayException) e).getType()).isEqualTo("upstream_failed");
                 });
         verify(metrics, never()).success(anyString(), anyString());
+        // 最终失败触发 ON_ERROR 钩子（eq + matcher：不能与 raw 值混用）
+        verify(pluginEngine).runPhase(eq(PluginPhase.ON_ERROR), any(PluginContext.class));
     }
 
     @Test
-    void allCandidatesFilteredByHealth_shouldReturn503() {
-        // 候选存在但渠道全被健康检查剔除 → 503 no_available_model
-        when(registry.findByAlias("qwen")).thenReturn(List.of(instance("mock-a:qwen-large"),
-                instance("mock-b:qwen-small")));
-        when(healthChecker.isHealthy(anyString())).thenReturn(false);
+    void primaryFailsWithoutBackup_shouldReturn502() {
+        RoutingDecision decision = decision(List.of());
+        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
+        when(connector.complete(any(), any())).thenThrow(new RuntimeException("boom"));
 
-        assertThatThrownBy(() -> service.complete(request(), "req-1"))
+        assertThatThrownBy(() -> service.complete(request(), "req-1", METADATA))
+                .isInstanceOf(GatewayException.class)
+                .satisfies(e -> {
+                    assertThat(((GatewayException) e).getStatus()).isEqualTo(502);
+                    assertThat(((GatewayException) e).getType()).isEqualTo("upstream_failed");
+                });
+        // 主选只调用一次，不重试
+        verify(connector).complete(any(), any());
+    }
+
+    @Test
+    void decisionFails_shouldPropagate503WithoutRecordingLog() {
+        when(decisionEngine.decide(any(), anyString(), any()))
+                .thenThrow(new GatewayException(503, "no_available_model", "候选为空"));
+
+        assertThatThrownBy(() -> service.complete(request(), "req-1", METADATA))
                 .isInstanceOf(GatewayException.class)
                 .satisfies(e -> {
                     assertThat(((GatewayException) e).getStatus()).isEqualTo(503);
                     assertThat(((GatewayException) e).getType()).isEqualTo("no_available_model");
                 });
+        verify(decisionLogStore, never()).record(any());
         verify(connector, never()).complete(any(), any());
     }
 
     @Test
-    void unknownModel_shouldReturn503() {
-        when(registry.findByAlias("unknown")).thenReturn(List.of());
+    void successPath_shouldRecordSuccessAndTriggerAfterExecution() {
+        RoutingDecision decision = decision(List.of());
+        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
+        when(connector.complete(any(), any())).thenReturn(COMPLETION);
 
-        assertThatThrownBy(() -> service.complete(
-                new ChatRequest("unknown", List.of(), false, null, null), "req-1"))
-                .isInstanceOf(GatewayException.class)
-                .satisfies(e -> {
-                    assertThat(((GatewayException) e).getStatus()).isEqualTo(503);
-                    assertThat(((GatewayException) e).getType()).isEqualTo("no_available_model");
-                });
+        ChatCompletion result = service.complete(request(), "req-1", METADATA);
+
+        assertThat(result).isEqualTo(COMPLETION);
+        verify(stateStore).recordSuccess(eq("mock-a:qwen-large"), anyLong());
+        verify(stateStore).beginRequest("mock-a:qwen-large");
+        verify(stateStore).endRequest("mock-a:qwen-large");
+        verify(metrics).success("qwen", "mock-a:qwen-large");
+        verify(pluginEngine).runPhase(eq(PluginPhase.AFTER_EXECUTION), any(PluginContext.class));
     }
 }

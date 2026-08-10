@@ -7,6 +7,7 @@ import com.aigateway.observability.GatewayMetrics;
 import com.aigateway.plugin.context.PluginContext;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
@@ -29,15 +30,43 @@ public class FilterChain {
 
     public FilterChain(List<CandidateFilter> filters, GatewayMetrics metrics) {
         this.filters = filters.stream()
-                .sorted(Comparator.comparingInt(CandidateFilter::order))
+                .sorted(Comparator.comparingInt(CandidateFilter::order).reversed())
                 .toList();
         this.metrics = metrics;
     }
 
-    /** TODO H2：按《版本2-详细实施计划》第 9.3 节手敲实现 */
+    /**
+     * 依次执行五道关卡；每道返回收窄后的候选集。
+     *
+     * 规则：
+     * 1. 只收窄、不扩大：过滤器的返回值不得包含入参里没有的候选；
+     * 2. 淘汰计数写入指标与日志（可解释“为什么少了候选”）；
+     * 3. 任一道把候选清空 → 503 no_available_model（fail-closed，
+     *    不回退到过滤前的候选集——策略不可被绕过）。
+     */
     public List<ModelInstance> apply(ChatRequest request, PluginContext ctx,
                                      List<ModelInstance> candidates) {
-        throw new GatewayException(500, "not_implemented",
-                "TODO H2：FilterChain 未实现（按《版本2-详细实施计划》第 9.3 节手敲）");
+        List<ModelInstance> current = new ArrayList<>(candidates);
+        for(CandidateFilter filter : filters){
+            List<ModelInstance> before = current;
+            current = filter.apply(request, ctx, before);
+
+            int dropped = before.size() - current.size();
+            if(dropped > 0){
+                metrics.filterDrops(ctx.alias(), filter.name(), dropped);
+                log(ctx.requestId(), "候选过滤",
+                        filter.name() + " 淘汰 " + dropped + " 个，剩余 " + current.size() + " 个");
+            }
+
+            if (current.isEmpty()) {
+                throw new GatewayException(503, "no_available_model",
+                        "候选经[" + filter.name() + "]过滤后为空");
+            }
+        }
+        return current;
+    }
+
+    private static void log(String requestId, String event, String detail) {
+        System.out.printf("[requestId=%s] event=%s detail=%s%n", requestId, event, detail);
     }
 }

@@ -16,7 +16,7 @@ import java.util.List;
 public class BudgetFilter implements CandidateFilter {
 
     public int order() {
-        return 40;
+        return 20;
     }
 
     public String name() {

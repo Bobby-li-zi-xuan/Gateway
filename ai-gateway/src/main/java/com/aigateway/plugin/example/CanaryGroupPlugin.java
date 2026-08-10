@@ -54,6 +54,14 @@ public class CanaryGroupPlugin implements GatewayPlugin {
     }
 
     private static Set<String> toStringSet(Object value) {
+        if (value == null) {
+            return Set.of(); // null = 该分组未配置任何实例（配合白名单“存在但为空 → 全淘汰”语义）
+        }
+        if (value instanceof Map<?, ?> map) {
+            // Spring Boot 把 YAML list 绑定进 Map<String,Object> 时变成 index-keyed Map
+            //（{0=a, 1=b} 而非 List），按值转集合与 List 语义等价
+            return map.values().stream().map(String::valueOf).collect(Collectors.toSet());
+        }
         if (value instanceof List<?> list) {
             return list.stream().map(String::valueOf).collect(Collectors.toSet());
         }

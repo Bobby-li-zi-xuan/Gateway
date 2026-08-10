@@ -125,4 +125,49 @@ class PolicyManagerTest {
                 .isInstanceOf(GatewayException.class)
                 .hasMessageContaining("defaultStrategy");
     }
+
+    private GatewayProperties.PolicyDef conditional(String name, String defaultStrategy) {
+        GatewayProperties.PolicyDef def = new GatewayProperties.PolicyDef();
+        def.setName(name);
+        def.setType("CONDITIONAL");
+        def.setDefaultStrategy(defaultStrategy);
+        GatewayProperties.RuleDef rule = new GatewayProperties.RuleDef();
+        GatewayProperties.ConditionDef when = new GatewayProperties.ConditionDef();
+        when.setSignal("task_complexity");
+        when.setOp("EQ");
+        when.setValue("COMPLEX");
+        rule.setWhen(when);
+        GatewayProperties.CandidateRef ref = new GatewayProperties.CandidateRef();
+        ref.setChannelId("mock-a");
+        ref.setModel("qwen-large");
+        rule.getSelect().add(ref);
+        def.getRules().add(rule);
+        return def;
+    }
+
+    @Test
+    void conditionalFallbackDefinedLater_shouldStartup() {
+        // 两阶段校验（P3）：被引用的 MULTI_OBJECTIVE 回退策略定义在 CONDITIONAL 之后也能启动
+        GatewayProperties props = new GatewayProperties();
+        props.getPolicies().add(conditional("cond", "custom-multi"));
+        props.getPolicies().add(multiObjective("custom-multi",
+                Map.of("latency", 0.25, "cost", 0.25, "quality", 0.25, "health", 0.25)));
+
+        PolicyManager manager = new PolicyManager(props, registry);
+
+        assertThat(manager.byName("cond")).isNotNull();
+        assertThat(manager.byName("custom-multi")).isNotNull();
+    }
+
+    @Test
+    void conditionalFallbackNotMultiObjective_shouldFailStartup() {
+        // 回退策略是另一个 CONDITIONAL → 仍须拒绝
+        GatewayProperties props = new GatewayProperties();
+        props.getPolicies().add(conditional("cond", "cond2"));
+        props.getPolicies().add(conditional("cond2", "balanced"));
+
+        assertThatThrownBy(() -> new PolicyManager(props, registry))
+                .isInstanceOf(GatewayException.class)
+                .hasMessageContaining("defaultStrategy");
+    }
 }

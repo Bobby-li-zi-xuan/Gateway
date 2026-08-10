@@ -6,6 +6,7 @@ import com.aigateway.plugin.context.PluginContext;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -17,7 +18,7 @@ import java.util.Set;
 public class PluginSignalFilter implements CandidateFilter {
 
     public int order() {
-        return 50;
+        return 10;
     }
 
     public String name() {
@@ -26,14 +27,16 @@ public class PluginSignalFilter implements CandidateFilter {
 
     public List<ModelInstance> apply(ChatRequest request, PluginContext ctx,
                                      List<ModelInstance> candidates) {
-        Set<String> allowed = ctx.signals().getStringSet("allowed_instances").orElse(Set.of());
-        Set<String> blocked = ctx.signals().getStringSet("blocked_instances").orElse(Set.of());
+        // 以“信号是否存在”而非“集合是否为空”判断：插件写入空白名单（如金丝雀分组
+        // 未配置实例）意味着“一个都不允许”，此时若按 isEmpty 放行会造成 fail-open。
+        Optional<Set<String>> allowed = ctx.signals().getStringSet("allowed_instances");
+        Optional<Set<String>> blocked = ctx.signals().getStringSet("blocked_instances");
         if (allowed.isEmpty() && blocked.isEmpty()) {
             return candidates;
         }
         return candidates.stream()
-                .filter(c -> (allowed.isEmpty() || allowed.contains(c.instanceId()))
-                        && !blocked.contains(c.instanceId()))
+                .filter(c -> (allowed.isEmpty() || allowed.get().contains(c.instanceId()))
+                        && (blocked.isEmpty() || !blocked.get().contains(c.instanceId())))
                 .toList();
     }
 }

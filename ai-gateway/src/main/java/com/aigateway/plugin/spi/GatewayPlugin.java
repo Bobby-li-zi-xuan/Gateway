@@ -25,7 +25,7 @@ public interface GatewayPlugin {
     /** 声明式作用域：GLOBAL / ROUTE / MODEL（配合 PluginRegistration.matches 精确匹配） */
     default PluginScope scope() { return PluginScope.GLOBAL; }
 
-    /** 同阶段内的执行顺序（Kong priority 思想：数字小的先执行） */
+    /** 同阶段内的执行顺序（Kong priority 思想：数字大的先执行） */
     default int order() { return 0; }
 
     /** 启动校验：配置不符合 Schema 时抛 GatewayException，导致启动失败 */
@@ -34,13 +34,18 @@ public interface GatewayPlugin {
     /** 启动时由注册表调用一次：把 YAML 配置应用到实例 */
     default void configure(Map<String, Object> config) {}
 
+    /** 路由决策前，按条件收窄候选模型池 */
     default void beforeDecision(PluginContext ctx) {}
 
+    /** 决策完成后，观察/审计最终的模型 */
     default void afterDecision(PluginContext ctx) {}
 
+    /** 调用上游模型前，改写请求体，注入上下文 */
     default void beforeExecution(PluginContext ctx) {}
 
+    /** 上游响应后，记录信号，质量评分 */
     default void afterExecution(PluginContext ctx) {}
 
+    /** 任意一处出错，拿到错误信息 */
     default void onError(PluginContext ctx, Throwable t) {}
 }

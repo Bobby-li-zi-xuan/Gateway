@@ -11,7 +11,7 @@ import java.util.stream.Collectors;
  * 路由信号表（LiteLLM RoutingContext.signals 的对应物）：
  * 插件之间、插件与决策器之间传递结构化键值。
  *
- * 写入幂等的约定（学习版文档 4.2）：同一次请求内重复执行插件链，
+ * 写入幂等的约定：同一次请求内重复执行插件链，
  * 同一信号 key 的最终值必须一致。实现时避免“先 get 再追加 list”这类非幂等写法；
  * 需要集合时整体 set 一个新集合。
  */

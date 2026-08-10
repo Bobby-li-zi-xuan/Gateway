@@ -40,6 +40,11 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <!-- classifier=exec：主 artifact 保持普通 jar（其他模块编译期可依赖），
+                         可执行 fat jar 输出为 -exec.jar（避免 javac 无法读取 BOOT-INF/classes） -->
+                    <classifier>exec</classifier>
+                </configuration>
             </plugin>
         </plugins>
     </build>

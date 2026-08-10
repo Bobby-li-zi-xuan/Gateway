@@ -19,7 +19,7 @@ import java.util.Set;
 public class CapabilityFilter implements CandidateFilter {
 
     public int order() {
-        return 10;
+        return 50;
     }
 
     public String name() {
@@ -28,6 +28,7 @@ public class CapabilityFilter implements CandidateFilter {
 
     public List<ModelInstance> apply(ChatRequest request, PluginContext ctx,
                                      List<ModelInstance> candidates) {
+        // required_capabilities 由 DecisionEngine 在决策前写入                                
         Set<String> required = ctx.signals().getStringSet("required_capabilities").orElse(Set.of());
         int estimatedTokens = estimateInputTokens(request);
         return candidates.stream()
@@ -43,17 +44,28 @@ public class CapabilityFilter implements CandidateFilter {
         if (required.contains("streaming") && !cap.isStreaming()) return false;
         if (required.contains("tools") && !cap.isToolCallSupport()) return false;
         if (required.contains("vision") && !cap.isMultimodal()) return false;
-        return cap.getContextLength() >= tokens;
+        // contextLength <= 0 视为未配置（int 默认值 0），与 cap == null 的“不做限制”语义对齐
+        return cap.getContextLength() <= 0 || cap.getContextLength() >= tokens;
     }
 
-    /** 简单 token 估算：汉字约 3 字/token，至少 1（与 mock 保持一致） */
+    /** 输入 token 估算：逐条消息按文本折算后求和，至少 1（口径与 mock、版本4 计量 4.5 一致） */
     private static int estimateInputTokens(ChatRequest request) {
         if (request.messages() == null) return 1;
-        int chars = request.messages().stream()
+        int tokens = request.messages().stream()
                 .map(ChatRequest.Message::content)
                 .filter(s -> s != null)
-                .mapToInt(String::length)
+                .mapToInt(CapabilityFilter::estimateTextTokens)
                 .sum();
-        return Math.max(1, chars / 3);
+        return Math.max(1, tokens);
+    }
+
+    /** 文本 → token 近似：CJK 字符约 1 字/token，其余约 4 字符/token（BPE 实际中文 1~2 token/字，故统一按 1 计为下限口径） */
+    private static int estimateTextTokens(String text) {
+        int cjk = 0, other = 0;
+        for (char c : text.toCharArray()) {
+            if (Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN) cjk++;
+            else other++;
+        }
+        return cjk + (other + 3) / 4;
     }
 }

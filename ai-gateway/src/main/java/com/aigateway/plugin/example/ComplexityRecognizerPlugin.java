@@ -28,7 +28,7 @@ public class ComplexityRecognizerPlugin implements GatewayPlugin {
     }
 
     public int order() {
-        return 10;
+        return 30;
     }
 
     /** 配置校验：keywordRegex 必须能编译成合法正则，否则启动失败 */

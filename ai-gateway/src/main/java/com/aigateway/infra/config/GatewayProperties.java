@@ -114,7 +114,7 @@ public class GatewayProperties {
     @Data
     public static class ConditionDef {
         private String signal;                     // 信号名，如 task_complexity
-        private String op = "EQ";                  // EQ / NE / IN
+        private String op = "EQ";                  // EQ（等于）、NE（不等于）、IN（包含于）
         private Object value;                      // 标量或列表（IN）
     }
 
@@ -132,7 +132,7 @@ public class GatewayProperties {
         private String name;                       // 插件名（GatewayPlugin.name() 对应）
         private String scope = "GLOBAL";           // GLOBAL / ROUTE / MODEL
         private String scopeValue = "";            // ROUTE=别名；MODEL=instanceId
-        private int order = 0;                     // 同阶段内执行顺序（小 → 大）
+        private int order = 0;                     // 同阶段内执行顺序（数字大的先执行）
         private Map<String, Object> config = new HashMap<>(); // 插件实例配置
     }
 }

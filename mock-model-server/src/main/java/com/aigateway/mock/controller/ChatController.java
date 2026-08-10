@@ -8,6 +8,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -16,6 +17,9 @@ import java.util.UUID;
  * Mock 聊天接口：模拟 OpenAI 兼容的非流式与流式（SSE）响应。
  *
  * 学习要点：
+ * - OpenAI 约定 stream 是“请求体字段”（不是查询参数），所以这里用
+ *   “读 body 里的 stream 字段”分流，而不是 @PostMapping(params=...)；
+ *   这样与网关 H3（body 带 stream=true）以及真实客户端语义保持一致；
  * - 非流式：模拟延迟后一次性返回完整 JSON；
  * - 流式：按 responseStyle 把内容切成 token，用虚拟线程配合 SseEmitter
  *   逐个推送增量 chunk（Spring 会自动按 data: 帧格式输出，网关端逐行读取即可）；
@@ -32,9 +36,20 @@ public class ChatController {
         this.gen = gen;
     }
 
-    /** 非流式推理：POST /v1/chat/completions（不带 stream=true） */
+    /**
+     * 统一入口：POST /v1/chat/completions。
+     * 根据请求体里的 stream 字段分流：true → SSE 流式；否则非流式 JSON。
+     */
     @PostMapping("/v1/chat/completions")
-    public Map<String, Object> chat(@RequestBody Map<String, Object> request) {
+    public Object chat(@RequestBody Map<String, Object> request) {
+        if (Boolean.TRUE.equals(request.get("stream"))) {
+            return chatStream(request);
+        }
+        return chatOnce(request);
+    }
+
+    /** 非流式推理：模拟延迟后返回 OpenAI 非流式格式 */
+    private Map<String, Object> chatOnce(Map<String, Object> request) {
         ModelProfile profile = registry.getProfile();
         String requestId = "chatcmpl-" + UUID.randomUUID().toString().substring(0, 8);
         registry.requestStarted(); // 计入活跃请求数（/health 会展示）
@@ -65,21 +80,19 @@ public class ChatController {
                 )),
                 "usage", Map.of(
                         "prompt_tokens", estimateTokens(request),
-                        "completion_tokens", content.length() / 3, // 粗略估算：汉字约 1 token/字
-                        "total_tokens", estimateTokens(request) + content.length() / 3
+                        "completion_tokens", estimateTextTokens(content),
+                        "total_tokens", estimateTokens(request) + estimateTextTokens(content)
                 )
         );
     }
 
     /**
-     * 流式推理：POST /v1/chat/completions?stream=true。
-     * Spring 用 params = "stream=true" 区分流式/非流式两个 handler。
+     * 流式推理。
      *
      * 流程：生成内容 → 切成 token → 虚拟线程里逐 token send chunk →
      * 最后发一个 finish_reason=stop 的结束 chunk → complete()。
      */
-    @PostMapping(value = "/v1/chat/completions", params = "stream=true")
-    public SseEmitter chatStream(@RequestBody Map<String, Object> request) {
+    private SseEmitter chatStream(Map<String, Object> request) {
         ModelProfile profile = registry.getProfile();
         String requestId = "chatcmpl-" + UUID.randomUUID().toString().substring(0, 8);
         String content = gen.generate(profile);
@@ -122,21 +135,23 @@ public class ChatController {
 
     /**
      * 构造一个 OpenAI 流式 chunk：
-     * delta 是增量文本（结束 chunk 为 null 值空 map），finish_reason 只在结束时为 "stop"。
+     * - delta 是增量文本（结束 chunk 为 null 值空 map）；
+     * - finish_reason 只在结束 chunk 出现（OpenAI 协议中间 chunk 为 null/缺省）。
+     * 注意：Map.of 不允许 null 值，所以这里用 HashMap 按需放入 finish_reason。
      */
     private Map<String, Object> buildChunk(String id, String model, String delta, boolean isLast) {
+        Map<String, Object> choice = new HashMap<>();
+        choice.put("index", 0);
+        choice.put("delta", delta.isEmpty() ? Map.of() : Map.of("content", delta));
+        if (isLast) {
+            choice.put("finish_reason", "stop");
+        }
         return Map.of(
                 "id", id,
                 "object", "chat.completion.chunk",
                 "created", System.currentTimeMillis() / 1000,
                 "model", model,
-                "choices", List.of(Map.of(
-                        "index", 0,
-                        "delta", delta.isEmpty()
-                                ? Map.of()
-                                : Map.of("content", delta),
-                        "finish_reason", isLast ? "stop" : (Object) null
-                ))
+                "choices", List.of(choice)
         );
     }
 
@@ -152,7 +167,7 @@ public class ChatController {
         return content.split("(?<=[。，,])");
     }
 
-    /** 简单 Token 估算：汉字按 3 字/token 粗略折算，至少返回 1，用于 usage 字段 */
+    /** 输入 Token 估算：中文约 1 字/token、其他约 4 字符/token（口径与 ai-gateway CapabilityFilter 一致），至少返回 1，用于 usage 字段 */
     private int estimateTokens(Map<String, Object> request) {
         @SuppressWarnings("unchecked")
         var messages = (List<Map<String, Object>>) request.get("messages");
@@ -162,9 +177,19 @@ public class ChatController {
         for (var msg : messages) {
             Object content = msg.get("content");
             if (content instanceof String s) {
-                total += s.length() / 3;
+                total += estimateTextTokens(s);
             }
         }
         return Math.max(total, 1);
+    }
+
+    /** 文本 → token 近似：CJK 字符约 1 字/token，其余约 4 字符/token */
+    private static int estimateTextTokens(String text) {
+        int cjk = 0, other = 0;
+        for (char c : text.toCharArray()) {
+            if (Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN) cjk++;
+            else other++;
+        }
+        return cjk + (other + 3) / 4;
     }
 }
