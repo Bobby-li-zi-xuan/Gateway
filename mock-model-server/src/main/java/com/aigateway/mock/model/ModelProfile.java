@@ -8,7 +8,8 @@ import java.util.Map;
  * 学习要点：
  * - record 不可变：BehaviorController 每次修改参数都会生成新实例并替换引用，
  *   保证读线程看到的是完整一致的画像（不会读到改了一半的状态）；
- * - 启动时通过 --mock.model=xxx 选择模型，其余参数由 ModelRegistry 提供默认值。
+ * - 启动时通过 --mock.model=xxx 选择模型，其余参数由 ModelRegistry 提供默认值；
+ * - V3 新增 6 个故障注入字段（错误状态码 / Retry-After / 流式中途故障 / 停顿 / 错误事件）。
  */
 public record ModelProfile (
     String name,                 // 模型对外名称（如 qwen-large）
@@ -21,5 +22,12 @@ public record ModelProfile (
     double gpuUsage,             // /health 返回的 GPU 使用率（模拟值）
     double memoryUsage,          // /health 返回的显存使用率（模拟值）
     String responseStyle,        // 响应风格：CODE / ANALYSIS / CHAT
-    Map<String, Object> metadata // 额外元数据（能力标签等，V2 调度用）
+    Map<String, Object> metadata, // 额外元数据（能力标签等，V2 调度用）
+    // ── V3 新增（故障注入参数，演示网关容错）──
+    int errorStatus,              // 故障注入的 HTTP 状态码（默认 500）
+    int retryAfterSeconds,        // 429 时返回的 Retry-After 秒数
+    int streamFailAfterChunks,    // 流式发送 N 个 chunk 后异常断开；-1 = 关闭
+    int streamStallAfterChunks,   // 流式发送 N 个 chunk 后停顿；-1 = 关闭
+    long streamStallMs,           // 停顿时长（毫秒）
+    int streamErrorAfterChunks    // 流式发送 N 个 chunk 后发错误事件；-1 = 关闭
 ){}

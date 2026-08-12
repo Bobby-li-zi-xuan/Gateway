@@ -1,16 +1,46 @@
-# 网关配置（V2 完整结构，对照《版本2-详细实施计划》第 5.1 节）
+# 网关配置（V3 完整结构，对照《版本3-详细实施计划》第 5.1 节）
 #
-# V1 结构（health / channels / models）保留；V2 新增：
-# - gateway.decision：决策引擎参数（决策日志容量 / EWMA 系数 / 默认输出 token）
-# - models[].strategy：引用 gateway.policies 里的策略模板
-# - 候选的价格 / 质量 / 延迟画像（Scorer 打分输入）
-# - gateway.policies：策略模板（MULTI_OBJECTIVE / WEIGHTED_RANDOM / CONDITIONAL）
-# - gateway.plugins：插件挂载（按 name 匹配 SPI 实例）
+# V1 结构（health / channels / models）保留；V2 新增 decision / policies / plugins；
+# V3 新增：
+# - gateway.execution：容错治理参数（重试 / 分层超时 / 熔断 / 冷却，全部有缺省）
+# - channels[].timeout：渠道级超时覆盖（可选，不配则用 execution.defaultTimeout）
 gateway:
   health:
     intervalSeconds: 5
     timeoutMs: 2000
     consecutiveFailures: 3
+
+  execution:                    # V3 新增：容错治理参数（全部有缺省，旧配置可直接启动）
+    totalMs: 60000              # 整条降级链的总时长上限（所有候选/尝试共享）
+    defaultTimeout:             # 渠道级缺省分层超时
+      connectMs: 500            # 建立 TCP 连接
+      requestMs: 30000          # 非流式：发请求到收完整响应
+      firstByteMs: 10000        # 流式：发请求到收到首个数据 chunk
+      idleMs: 30000             # 流式：相邻 chunk 的最大间隔（空闲超时）
+    retry:
+      maxAttemptsPerCandidate: 1        # 每个候选默认尝试次数（默认 1 = 不重试同实例）
+      sameInstanceOnConnectionFailure: true  # 连接级失败允许同实例重试一次（学习版 4.1）
+      respectRetryAfter: true           # 429 时优先遵循上游 Retry-After
+      maxRetryAfterMs: 5000             # Retry-After 等待上限，防止被上游拖死
+      backoffBaseMs: 100                # 指数退避基数
+      backoffMaxMs: 2000                # 退避上限
+      jitterRatio: 0.2                  # 随机抖动比例（防惊群）
+      retryableStatuses: [429, 500, 502, 503, 504]
+    circuitBreaker:
+      windowSize: 100            # 环形窗口：统计最近 N 次调用
+      minimumRequests: 5         # 样本不足时不触发熔断
+      failureRateThreshold: 0.5  # 失败率阈值（0~1）
+      slowCallThresholdMs: 10000 # 超过该延迟判定为慢调用
+      slowCallRateThreshold: 0.5 # 慢调用率阈值
+      openDurationMs: 30000      # 打开状态持续时间
+      halfOpenMaxRequests: 1     # 半开态放行的探测请求数
+    cooldown:
+      consecutiveFailures: 5     # 连续失败多少次进入冷却
+      cooldownMs: 30000          # 冷却时长
+      maxCooldownMs: 300000      # 恢复探测失败翻倍的上限
+      recoveryProbe: true        # 恢复后第一个请求视为探测，失败则时长翻倍
+    state:
+      flushIntervalMs: 500       # 状态事件管道聚合周期（毫秒）
 
   decision:
     logSize: 100
@@ -24,11 +54,17 @@ gateway:
       baseUrl: http://localhost:8001
       credentialsRef: ""          # 空表示无需密钥（mock）；真实上游写 env:OPENAI_API_KEY
       weight: 10
+      timeout:                   # V3 可选：渠道级覆盖；不配则用 defaultTimeout
+        connectMs: 500
+        requestMs: 30000
+        firstByteMs: 8000
+        idleMs: 20000
     - id: mock-b
       provider: openai-compatible
       baseUrl: http://localhost:8002
       credentialsRef: ""
       weight: 5
+      # timeout 不配 → 用 execution.defaultTimeout
 
   models:
     - alias: qwen

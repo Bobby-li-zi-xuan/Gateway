@@ -2,6 +2,7 @@ package com.aigateway.decision.state;
 
 import com.aigateway.core.domain.model.ModelInstance;
 import com.aigateway.decision.model.ModelState;
+import com.aigateway.execution.model.CircuitState;
 import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.state.registry.ModelRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,8 +19,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * 状态闭环单测（计划 20.1，H5）：
- * EWMA 收敛 / 并发更新不丢（最终状态合法）。
+ * 状态闭环单测（V3 版，详细实施计划 18.1 H7）：
+ * 脚手架部分（stateOf / beginRequest / endRequest）已可用；
+ * apply(StateEvent) 相关用例需在 H7 手敲完成后启用（当前标注 TODO H7）。
+ *
+ * V2 → V3 变化：recordSuccess/recordFailure 已删除，统一改为事件入口
+ * StateEventPipeline.flush() → ModelStateStore.apply(event)。
  */
 class ModelStateStoreTest {
 
@@ -33,6 +38,7 @@ class ModelStateStoreTest {
         ModelInstance instance = new ModelInstance(INSTANCE, "qwen", "mock-a", "qwen-large",
                 1, null, 0.001, 0.002, 0.9, 1000L);
         when(registry.findAll()).thenReturn(List.of(instance));
+        when(registry.findByChannelId("mock-a")).thenReturn(List.of(instance));
         store = new ModelStateStore(new GatewayProperties(), registry);
     }
 
@@ -41,43 +47,47 @@ class ModelStateStoreTest {
         ModelState state = store.stateOf(INSTANCE);
         assertThat(state.ewmaLatencyMs()).isEqualTo(1000.0); // 配置的 latencyProfileMs
         assertThat(state.errorRate()).isEqualTo(0.0);
+        assertThat(state.circuitState()).isEqualTo(CircuitState.CLOSED); // V3 初始为关闭
+        assertThat(state.cooling()).isFalse();
     }
 
     @Test
-    void consecutiveSuccess_shouldConvergeLatencyAndDecayErrorRate() {
-        // 连续成功样本后 EWMA 延迟向样本值收敛（α=0.3），错误率向 0 衰减
-        store.recordFailure(INSTANCE); // 先制造一个错误样本
-        double errorAfterFailure = store.stateOf(INSTANCE).errorRate();
-        assertThat(errorAfterFailure).isGreaterThan(0.0);
+    void beginEndRequest_shouldTrackInFlight() {
+        store.beginRequest(INSTANCE);
+        store.beginRequest(INSTANCE);
+        assertThat(store.stateOf(INSTANCE).inFlight()).isEqualTo(2);
 
-        double latency = store.stateOf(INSTANCE).ewmaLatencyMs();
-        for (int i = 0; i < 20; i++) {
-            store.recordSuccess(INSTANCE, 200);
-            double next = store.stateOf(INSTANCE).ewmaLatencyMs();
-            assertThat(next).isLessThan(latency); // 单调向 200 收敛
-            latency = next;
-        }
-        assertThat(store.stateOf(INSTANCE).ewmaLatencyMs()).isCloseTo(200.0,
-                org.assertj.core.data.Offset.offset(1.0));
-        // 错误率：0.1 × 0.9^20 ≈ 0.0122，收敛到接近 0（宽松区间避免浮点敏感）
-        assertThat(store.stateOf(INSTANCE).errorRate()).isLessThan(0.02);
+        store.endRequest(INSTANCE);
+        assertThat(store.stateOf(INSTANCE).inFlight()).isEqualTo(1);
+    }
+
+    // ══ TODO H7（手敲完成后启用）══
+    // 以下用例的调用入口已改为事件管道，需 H7 实现 apply 后运行：
+
+    @Test
+    void consecutiveSuccess_shouldConvergeLatencyAndDecayErrorRate() {
+        // TODO H7: store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
+        //         → 错误率 > 0
+        // TODO H7: 连续 20 次 store.apply(new StateEvent.Success(INSTANCE, 200))
+        //         → EWMA 延迟向 200 收敛（α=0.3）、错误率 < 0.02
     }
 
     @Test
     void failure_shouldSlideErrorRateTowardsOneWithoutTouchingLatency() {
-        double before = store.stateOf(INSTANCE).ewmaLatencyMs();
+        // TODO H7: apply(Failure) 后错误率 = 0.1（α=0.1）、延迟不变
+        // TODO H7: apply(SlowCall) 后 slowCalls 累计、apply(CircuitTransition) 后 circuitState 更新
+    }
 
-        store.recordFailure(INSTANCE);
-
-        ModelState state = store.stateOf(INSTANCE);
-        assertThat(state.errorRate()).isEqualTo(0.1); // α=0.1：0.1×1 + 0.9×0
-        assertThat(state.ewmaLatencyMs()).isEqualTo(before); // 失败没有可用延迟样本
+    @Test
+    void cooldownChange_shouldBroadcastToChannelInstances() {
+        // TODO H7: apply(new StateEvent.CooldownChange("mock-a", true, 30_000))
+        //         → 该渠道全部实例 cooling() == true；未知渠道不抛异常
     }
 
     @Test
     void concurrentUpdates_shouldNotLoseState() throws InterruptedException {
-        // 多线程并发 recordFailure：错误率按 EWMA 公式每次乘 0.9 再 +0.1，
-        // 最终理论值 = 1 - 0.9^50；若丢更新，最终值会显著偏低
+        // TODO H7: 多线程并发 offer(Failure) + flush() 后错误率接近 1 - 0.9^50
+        // （单写者纪律：测试里手动调用 flush() 代替定时器）
         int threads = 50;
         ExecutorService pool = Executors.newFixedThreadPool(8);
         CountDownLatch ready = new CountDownLatch(threads);
@@ -88,7 +98,7 @@ class ModelStateStoreTest {
                 ready.countDown();
                 try {
                     start.await();
-                    store.recordFailure(INSTANCE);
+                    // TODO H7: store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 } finally {
@@ -101,18 +111,6 @@ class ModelStateStoreTest {
         assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
         pool.shutdown();
 
-        double expected = 1.0 - Math.pow(0.9, threads); // 0.995 附近
-        assertThat(store.stateOf(INSTANCE).errorRate())
-                .isCloseTo(expected, org.assertj.core.data.Offset.offset(0.001));
-    }
-
-    @Test
-    void beginEndRequest_shouldTrackInFlight() {
-        store.beginRequest(INSTANCE);
-        store.beginRequest(INSTANCE);
-        assertThat(store.stateOf(INSTANCE).inFlight()).isEqualTo(2);
-
-        store.endRequest(INSTANCE);
-        assertThat(store.stateOf(INSTANCE).inFlight()).isEqualTo(1);
+        // TODO H7: 断言错误率 ≈ 1 - 0.9^50（若 apply 未实现，此断言不会执行）
     }
 }

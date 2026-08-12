@@ -30,6 +30,9 @@ public class GatewayProperties {
     /** 健康检查参数：间隔、单次探活超时、连续失败多少次后判为不健康 */
     private Health health = new Health();
 
+    /** V3 容错治理参数：重试/超时/熔断/冷却（全部有缺省，旧配置可直接启动） */
+    private Execution execution = new Execution();
+
     /** V2 决策引擎参数：日志容量、EWMA 系数、默认输出 token 数 */
     private Decision decision = new Decision();
 
@@ -53,6 +56,66 @@ public class GatewayProperties {
         private int consecutiveFailures = 3;     // 连续失败多少次后标记不健康
     }
 
+    /** V3 容错治理参数定义（嵌套类字段名与 model.yml 的 execution 段一一对应） */
+    @Data
+    public static class Execution {
+        private long totalMs = 60_000;                       // 整条降级链总时长上限
+        private TimeoutDef defaultTimeout = new TimeoutDef(); // 渠道级缺省分层超时
+        private RetryDef retry = new RetryDef();
+        private CircuitBreakerDef circuitBreaker = new CircuitBreakerDef();
+        private CooldownDef cooldown = new CooldownDef();
+        private StateDef state = new StateDef();
+    }
+
+    /** 分层超时定义：连接 / 完整响应 / 首字节 / 空闲 */
+    @Data
+    public static class TimeoutDef {
+        private long connectMs = 500;
+        private long requestMs = 30_000;
+        private long firstByteMs = 10_000;
+        private long idleMs = 30_000;
+    }
+
+    /** 重试配置定义 */
+    @Data
+    public static class RetryDef {
+        private int maxAttemptsPerCandidate = 1;       // 每个候选默认尝试次数（1 = 不重试同实例）
+        private boolean sameInstanceOnConnectionFailure = true; // 连接级失败允许同实例重试一次
+        private boolean respectRetryAfter = true;      // 429 优先遵循 Retry-After
+        private long maxRetryAfterMs = 5_000;          // Retry-After 等待上限
+        private long backoffBaseMs = 100;              // 指数退避基数
+        private long backoffMaxMs = 2_000;             // 退避上限
+        private double jitterRatio = 0.2;              // 随机抖动比例（防惊群）
+        private List<Integer> retryableStatuses = List.of(429, 500, 502, 503, 504);
+    }
+
+    /** 熔断配置定义 */
+    @Data
+    public static class CircuitBreakerDef {
+        private int windowSize = 100;                  // 环形窗口大小
+        private int minimumRequests = 5;               // 最少样本数（样本不足不触发）
+        private double failureRateThreshold = 0.5;     // 失败率阈值（0~1）
+        private long slowCallThresholdMs = 10_000;     // 慢调用判定阈值
+        private double slowCallRateThreshold = 0.5;    // 慢调用率阈值（0~1）
+        private long openDurationMs = 30_000;          // 打开状态持续时间
+        private int halfOpenMaxRequests = 1;           // 半开态放行的探测请求数
+    }
+
+    /** 冷却配置定义 */
+    @Data
+    public static class CooldownDef {
+        private int consecutiveFailures = 5;           // 连续失败进入冷却的阈值
+        private long cooldownMs = 30_000;              // 冷却时长
+        private long maxCooldownMs = 300_000;          // 冷却翻倍上限
+        private boolean recoveryProbe = true;          // 恢复探测开关
+    }
+
+    /** 状态管道配置定义 */
+    @Data
+    public static class StateDef {
+        private long flushIntervalMs = 500;            // 状态事件管道聚合周期（毫秒）
+    }
+
     /** V2 决策引擎参数定义 */
     @Data
     public static class Decision {
@@ -70,6 +133,7 @@ public class GatewayProperties {
         private String baseUrl;         // 上游基础地址
         private String credentialsRef = ""; // 密钥引用（env:XXX），默认为空 = 无需鉴权
         private int weight = 1;         // 渠道权重
+        private TimeoutDef timeout;     // V3 渠道级超时覆盖（可选；null = 用 execution.defaultTimeout）
     }
 
     /** 模型定义：一个对外别名下的候选列表 */

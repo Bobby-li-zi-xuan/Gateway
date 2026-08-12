@@ -4,6 +4,7 @@ import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.domain.model.ModelInstance;
 import com.aigateway.decision.model.ModelState;
 import com.aigateway.decision.model.ScoringDetail;
+import com.aigateway.execution.model.CircuitState;
 import com.aigateway.decision.state.ModelStateStore;
 import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.plugin.context.Signals;
@@ -44,7 +45,8 @@ class ScorerTest {
         when(stateStore.stateOf(anyString())).thenAnswer(inv -> {
             String id = inv.getArgument(0);
             long latency = id.contains("qwen-small") ? 200 : 2000;
-            return new ModelState(id, latency, 0.0, 0, System.currentTimeMillis());
+            return new ModelState(id, latency, 0.0, 0, System.currentTimeMillis(),
+                    CircuitState.CLOSED, 0, 0, false);
         });
     }
 
@@ -84,7 +86,7 @@ class ScorerTest {
         // 两个候选延迟相同 → max==min → 该因子全部满分，不除零
         List<ModelInstance> candidates = List.of(a, a);
         when(stateStore.stateOf(anyString())).thenReturn(
-                new ModelState("x", 500, 0.0, 0, 0));
+                new ModelState("x", 500, 0.0, 0, 0, CircuitState.CLOSED, 0, 0, false));
 
         List<ScoringDetail> details = scorer.score(candidates,
                 Map.of("latency", 0.6, "cost", 0.1, "quality", 0.15, "health", 0.15),

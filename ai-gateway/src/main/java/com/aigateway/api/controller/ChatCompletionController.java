@@ -4,6 +4,7 @@ import com.aigateway.api.dto.ChatChunk;
 import com.aigateway.api.dto.ChatCompletion;
 import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.service.ChatGatewayService;
+import com.aigateway.execution.stream.ClientDisconnectedException;
 import com.aigateway.infra.web.RequestIdFilter;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
@@ -13,8 +14,9 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -23,13 +25,16 @@ import java.util.UUID;
  * 职责：
  * 1. 接收客户端请求，统一生成 requestId 贯穿全链路；
  * 2. 根据 stream 参数分流：非流式直接返回完整 JSON；流式返回 SSE（Server-Sent Events）；
- * 3. V2：提取关键 header 为 metadata（tenant / canary_group），传入网关服务供示例插件消费。
+ * 3. V2：提取关键 header 为 metadata（tenant / canary_group），传入网关服务供示例插件消费；
+ * 4. V3：提取请求级容错 header（X-Gateway-Timeout-Ms / X-Gateway-Idle-Timeout-Ms，
+ *    由 ExecutionPolicyManager 解析校验）；客户端断开 → 抛 ClientDisconnectedException
+ *    让 StreamProxy（H6）走"取消上游"路径。
  *
  * 流式实现要点：
  * - {@link SseEmitter} 是 Spring MVC 的异步响应对象，会自动把 send() 的内容按
  *   {@code data: ...} 帧格式输出给客户端；
  * - 发送过程跑在独立的虚拟线程上：先由网关主流程（ChatGatewayService）向上游逐个
- *   读取 chunk，再通过回调写入 SseEmitter，做到“边收边转”，而不是攒完再返回。
+ *   读取 chunk，再通过回调写入 SseEmitter，做到"边收边转"，而不是攒完再返回。
  */
 @RestController
 public class ChatCompletionController {
@@ -63,10 +68,9 @@ public class ChatCompletionController {
      * 流式响应：返回 SseEmitter，并立刻返回 HTTP 200 + text/event-stream。
      *
      * 注意：
-     * - 必须“裸返回” SseEmitter，不能包在 ResponseEntity 里——Spring MVC 对
+     * - 必须"裸返回" SseEmitter，不能包在 ResponseEntity 里——Spring MVC 对
      *   ResponseEntity 走 HttpMessageConverter 路径，不支持 SseEmitter，
-     *   裸返回才会被 SseEmitterReturnValueHandler 接管（计划文档 S9 的示例写错了，
-     *   这里按正确行为实现）；
+     *   裸返回才会被 SseEmitterReturnValueHandler 接管；
      * - 控制器方法返回后，Tomcat 会挂起该连接；真正的数据由下面的虚拟线程
      *   逐步写入 emitter，写完调用 complete() 结束，异常则 completeWithError() 断开。
      */
@@ -83,14 +87,17 @@ public class ChatCompletionController {
                         // 一个 chunk 就是 OpenAI 格式的一段增量（{choices:[{delta:{content}}]}）
                         emitter.send(chunk);
                     } catch (IOException e) {
-                        // 客户端断开连接时 send 会抛 IOException，包装后由外层统一处理
-                        throw new UncheckedIOException(e);
+                        // 客户端断开连接：抛给 StreamProxy（H6）走"取消上游"路径——
+                        // 注意这是客户端行为，不是上游失败，外层不应记 failure 指标（风险第 11 条）
+                        throw new ClientDisconnectedException(e);
                     }
                 });
-                // 全部 chunk 发送完毕，正常结束 SSE 流
-                emitter.complete();
+                try {
+                    emitter.complete();
+                } catch (Exception ignore) {
+                    // 连接已断开，complete 可能抛 IllegalStateException——忽略即可
+                }
             } catch (Exception e) {
-                // 任一步骤失败：让客户端收到错误结束帧（而非悬挂等待）
                 emitter.completeWithError(e);
             }
         });
@@ -99,17 +106,23 @@ public class ChatCompletionController {
     }
 
     /**
-     * V2：把关键 header 提取成 metadata（示例插件消费），传入 gatewayService.complete/stream。
+     * 提取请求级容错 header 与 V2 的 tenant / canary_group（金丝雀插件 CanaryGroupPlugin 消费）。
+     * 超时 header 值不在此校验（正整数校验在 ExecutionPolicyManager.parseHeader，失败 → 400）。
      */
-    private Map<String, String> metadata(HttpServletRequest httpRequest) {
-        return Map.of(
-                "tenant", header(httpRequest, "X-Tenant-Id", "default"),
-                "canary_group", header(httpRequest, "X-Canary-Group", "stable"));
+    private Map<String, String> metadata(HttpServletRequest req) {
+        Map<String, String> result = new HashMap<>();
+        header(req, "X-Gateway-Timeout-Ms")
+                .ifPresent(v -> result.put("x-gateway-timeout-ms", v));
+        header(req, "X-Gateway-Idle-Timeout-Ms")
+                .ifPresent(v -> result.put("x-gateway-idle-timeout-ms", v));
+        result.put("tenant", header(req, "X-Tenant-Id").orElse("default"));
+        result.put("canary_group", header(req, "X-Canary-Group").orElse("stable"));
+        return Map.copyOf(result);
     }
 
-    private String header(HttpServletRequest req, String name, String fallback) {
+    private Optional<String> header(HttpServletRequest req, String name) {
         String value = req.getHeader(name);
-        return value == null || value.isBlank() ? fallback : value;
+        return value == null || value.isBlank() ? Optional.empty() : Optional.of(value.trim());
     }
 
     /**

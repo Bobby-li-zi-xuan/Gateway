@@ -3,49 +3,35 @@ package com.aigateway.core.service;
 import com.aigateway.api.dto.ChatCompletion;
 import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.domain.model.ModelInstance;
-import com.aigateway.core.exception.GatewayException;
-import com.aigateway.decision.engine.DecisionEngine;
-import com.aigateway.decision.engine.DecisionEngine.DecisionOutcome;
-import com.aigateway.decision.log.DecisionLogStore;
-import com.aigateway.decision.model.RoutingDecision;
-import com.aigateway.decision.state.ModelStateStore;
-import com.aigateway.execution.connector.OpenAIConnector;
-import com.aigateway.observability.GatewayMetrics;
-import com.aigateway.plugin.context.PluginContext;
-import com.aigateway.plugin.engine.PluginEngine;
-import com.aigateway.plugin.spi.PluginPhase;
+import com.aigateway.execution.fallback.ExecutionChainResolver;
+import com.aigateway.execution.fallback.FallbackChainExecutor;
+import com.aigateway.execution.stream.StreamProxy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 网关主流程单测（计划 20.1，H6）：决策与执行分离后的执行层语义。
+ * 网关主流程单测（V3 接线版，详细实施计划 18.1 最后一行"构造器/签名更新"）：
+ * ChatGatewayService 只做"链解析 + 交给执行器"，自身不含容错逻辑。
  *
- * 覆盖：主选失败 → fallbackChain[0]；全失败 → 502；决策失败 → 503 且不落决策日志；
- * 成功路径触发 AFTER_EXECUTION 钩子。
+ * 覆盖：非流式/流式都先解析候选链，再分别交给 FallbackChainExecutor（H5）/
+ * StreamProxy（H6）；H5/H6 未手敲前用 mock，验证接线调用关系。
  */
 class ChatGatewayServiceTest {
 
-    private final DecisionEngine decisionEngine = mock(DecisionEngine.class);
-    private final DecisionLogStore decisionLogStore = mock(DecisionLogStore.class);
-    private final OpenAIConnector connector = mock(OpenAIConnector.class);
-    private final ModelStateStore stateStore = mock(ModelStateStore.class);
-    private final GatewayMetrics metrics = mock(GatewayMetrics.class);
-    private final PluginEngine pluginEngine = mock(PluginEngine.class);
+    private final ExecutionChainResolver chainResolver = mock(ExecutionChainResolver.class);
+    private final FallbackChainExecutor fallbackExecutor = mock(FallbackChainExecutor.class);
+    private final StreamProxy streamProxy = mock(StreamProxy.class);
     private ChatGatewayService service;
 
     private static final ChatCompletion COMPLETION = new ChatCompletion(
@@ -58,8 +44,7 @@ class ChatGatewayServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new ChatGatewayService(decisionEngine, decisionLogStore,
-                connector, stateStore, metrics, pluginEngine);
+        service = new ChatGatewayService(chainResolver, fallbackExecutor, streamProxy);
     }
 
     private ModelInstance instance(String id) {
@@ -72,104 +57,46 @@ class ChatGatewayServiceTest {
                 false, null, null);
     }
 
-    private DecisionOutcome outcome(RoutingDecision decision) {
-        PluginContext ctx = new PluginContext(request(), "req-1", "qwen",
-                METADATA, decision.fallbackChain().isEmpty()
-                        ? List.of(decision.primary())
-                        : List.of(decision.primary(), decision.fallbackChain().get(0)));
-        return new DecisionOutcome(decision, ctx);
-    }
+    @Test
+    void complete_shouldResolveChainAndDelegateToFallbackExecutor() {
+        List<ModelInstance> chain = List.of(instance("mock-a:qwen-large"), instance("mock-b:qwen-small"));
+        when(chainResolver.resolve(any(), anyString(), any())).thenReturn(chain);
+        when(fallbackExecutor.execute(eq(chain), any(), anyString(), any())).thenReturn(COMPLETION);
 
-    private RoutingDecision decision(List<ModelInstance> fallbackChain) {
-        return new RoutingDecision("req-1", "qwen", "balanced",
-                instance("mock-a:qwen-large"), fallbackChain,
-                List.of(), Map.of(), null);
+        ChatCompletion result = service.complete(request(), "req-1", METADATA);
+
+        assertThat(result).isEqualTo(COMPLETION);
+        verify(chainResolver).resolve(request(), "req-1", METADATA);   // 链解析先执行
+        verify(fallbackExecutor).execute(chain, request(), "req-1", METADATA); // 交给 H5
     }
 
     @Test
-    void primaryFails_shouldFallbackToChainHead() {
-        RoutingDecision decision = decision(List.of(instance("mock-b:qwen-small")));
-        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
-        AtomicInteger calls = new AtomicInteger();
-        when(connector.complete(any(), any())).thenAnswer(inv -> {
-            if (calls.getAndIncrement() == 0) {
-                throw new RuntimeException("boom");
-            }
-            return COMPLETION;
+    void complete_shouldPropagateExecutionException() {
+        // 执行器（H5 未手敲时为 TODO 异常）抛出的异常原样上抛，不做二次包装
+        List<ModelInstance> chain = List.of(instance("mock-a:qwen-large"));
+        when(chainResolver.resolve(any(), anyString(), any())).thenReturn(chain);
+        when(fallbackExecutor.execute(any(), any(), anyString(), any()))
+                .thenThrow(new UnsupportedOperationException("TODO H5"));
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                        () -> service.complete(request(), "req-1", METADATA))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void stream_shouldResolveChainAndDelegateToStreamProxy() {
+        List<ModelInstance> chain = List.of(instance("mock-a:qwen-large"));
+        when(chainResolver.resolve(any(), anyString(), any())).thenReturn(chain);
+        // streamChain 是 void：用 doAnswer 模拟即可（验证调用关系）
+        org.mockito.Mockito.doNothing().when(streamProxy).streamChain(
+                eq(chain), any(), anyString(), any(), any());
+
+        ChatRequest streamRequest = request().withStream(true);
+        service.stream(streamRequest, "req-1", METADATA, chunk -> {
         });
 
-        ChatCompletion result = service.complete(request(), "req-1", METADATA);
-
-        assertThat(result).isEqualTo(COMPLETION);
-        verify(decisionLogStore).record(decision);              // 决策明细先落库
-        verify(metrics).failure("qwen", "mock-a:qwen-large");   // 主选失败计数
-        verify(metrics).success("qwen", "mock-b:qwen-small");   // 降级成功计数
-        // 执行阶段钩子：BEFORE_EXECUTION（主选前）+ AFTER_EXECUTION（降级成功后）
-        verify(pluginEngine).runPhase(eq(PluginPhase.BEFORE_EXECUTION), any(PluginContext.class));
-        verify(pluginEngine).runPhase(eq(PluginPhase.AFTER_EXECUTION), any(PluginContext.class));
-    }
-
-    @Test
-    void primaryAndBackupFail_shouldReturn502() {
-        RoutingDecision decision = decision(List.of(instance("mock-b:qwen-small")));
-        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
-        when(connector.complete(any(), any())).thenThrow(new RuntimeException("boom"));
-
-        assertThatThrownBy(() -> service.complete(request(), "req-1", METADATA))
-                .isInstanceOf(GatewayException.class)
-                .satisfies(e -> {
-                    assertThat(((GatewayException) e).getStatus()).isEqualTo(502);
-                    assertThat(((GatewayException) e).getType()).isEqualTo("upstream_failed");
-                });
-        verify(metrics, never()).success(anyString(), anyString());
-        // 最终失败触发 ON_ERROR 钩子（eq + matcher：不能与 raw 值混用）
-        verify(pluginEngine).runPhase(eq(PluginPhase.ON_ERROR), any(PluginContext.class));
-    }
-
-    @Test
-    void primaryFailsWithoutBackup_shouldReturn502() {
-        RoutingDecision decision = decision(List.of());
-        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
-        when(connector.complete(any(), any())).thenThrow(new RuntimeException("boom"));
-
-        assertThatThrownBy(() -> service.complete(request(), "req-1", METADATA))
-                .isInstanceOf(GatewayException.class)
-                .satisfies(e -> {
-                    assertThat(((GatewayException) e).getStatus()).isEqualTo(502);
-                    assertThat(((GatewayException) e).getType()).isEqualTo("upstream_failed");
-                });
-        // 主选只调用一次，不重试
-        verify(connector).complete(any(), any());
-    }
-
-    @Test
-    void decisionFails_shouldPropagate503WithoutRecordingLog() {
-        when(decisionEngine.decide(any(), anyString(), any()))
-                .thenThrow(new GatewayException(503, "no_available_model", "候选为空"));
-
-        assertThatThrownBy(() -> service.complete(request(), "req-1", METADATA))
-                .isInstanceOf(GatewayException.class)
-                .satisfies(e -> {
-                    assertThat(((GatewayException) e).getStatus()).isEqualTo(503);
-                    assertThat(((GatewayException) e).getType()).isEqualTo("no_available_model");
-                });
-        verify(decisionLogStore, never()).record(any());
-        verify(connector, never()).complete(any(), any());
-    }
-
-    @Test
-    void successPath_shouldRecordSuccessAndTriggerAfterExecution() {
-        RoutingDecision decision = decision(List.of());
-        when(decisionEngine.decide(any(), anyString(), any())).thenReturn(outcome(decision));
-        when(connector.complete(any(), any())).thenReturn(COMPLETION);
-
-        ChatCompletion result = service.complete(request(), "req-1", METADATA);
-
-        assertThat(result).isEqualTo(COMPLETION);
-        verify(stateStore).recordSuccess(eq("mock-a:qwen-large"), anyLong());
-        verify(stateStore).beginRequest("mock-a:qwen-large");
-        verify(stateStore).endRequest("mock-a:qwen-large");
-        verify(metrics).success("qwen", "mock-a:qwen-large");
-        verify(pluginEngine).runPhase(eq(PluginPhase.AFTER_EXECUTION), any(PluginContext.class));
+        verify(chainResolver).resolve(streamRequest, "req-1", METADATA);
+        verify(streamProxy).streamChain(eq(chain), eq(streamRequest), eq("req-1"),
+                eq(METADATA), any());
     }
 }

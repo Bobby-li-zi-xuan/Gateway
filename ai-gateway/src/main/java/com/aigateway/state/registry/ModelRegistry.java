@@ -166,6 +166,13 @@ public class ModelRegistry {
         return Optional.ofNullable(channels.get(channelId));
     }
 
+    /** V3：按渠道 ID 查旗下全部候选实例（冷却事件广播用）；渠道不存在返回空列表 */
+    public List<ModelInstance> findByChannelId(String channelId) {
+        return findAll().stream()
+                .filter(i -> i.channelId().equals(channelId))
+                .toList();
+    }
+
     /** 所有模型别名（GET /v1/models 用），返回不可变副本 */
     public List<String> aliases() {
         return List.copyOf(byAlias.keySet());

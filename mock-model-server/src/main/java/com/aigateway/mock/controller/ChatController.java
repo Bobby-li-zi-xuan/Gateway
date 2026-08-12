@@ -3,11 +3,13 @@ package com.aigateway.mock.controller;
 import com.aigateway.mock.model.ModelProfile;
 import com.aigateway.mock.model.ModelRegistry;
 import com.aigateway.mock.service.ResponseGenerator;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,13 +19,16 @@ import java.util.UUID;
  * Mock 聊天接口：模拟 OpenAI 兼容的非流式与流式（SSE）响应。
  *
  * 学习要点：
- * - OpenAI 约定 stream 是“请求体字段”（不是查询参数），所以这里用
- *   “读 body 里的 stream 字段”分流，而不是 @PostMapping(params=...)；
- *   这样与网关 H3（body 带 stream=true）以及真实客户端语义保持一致；
- * - 非流式：模拟延迟后一次性返回完整 JSON；
+ * - OpenAI 约定 stream 是"请求体字段"（不是查询参数），所以这里用
+ *   "读 body 里的 stream 字段"分流，而不是 @PostMapping(params=...)；
+ *   这样与网关（body 带 stream=true）以及真实客户端语义保持一致；
+ * - 非流式：模拟延迟后一次性返回完整 JSON；失败时按 errorStatus 返回对应错误码
+ *   （429 带 Retry-After 头，演示网关的重试与降级）；
  * - 流式：按 responseStyle 把内容切成 token，用虚拟线程配合 SseEmitter
  *   逐个推送增量 chunk（Spring 会自动按 data: 帧格式输出，网关端逐行读取即可）；
- * - shouldFail() 用于故障注入演示“网关失败切换”。
+ * - V3 故障注入：流式可配置"发 N 个 chunk 后断开 / 停顿 / 发错误事件"，
+ *   演示网关的 stream_interrupted（首字节后不降级）与空闲超时；
+ * - 客户端断开：emitter.send 抛 IOException 时打印断连日志（演示 C 的可观测性证据）。
  */
 @RestController
 public class ChatController {
@@ -48,8 +53,8 @@ public class ChatController {
         return chatOnce(request);
     }
 
-    /** 非流式推理：模拟延迟后返回 OpenAI 非流式格式 */
-    private Map<String, Object> chatOnce(Map<String, Object> request) {
+    /** 非流式推理：模拟延迟后返回 OpenAI 非流式格式；失败时按 errorStatus 返回对应错误 */
+    private Object chatOnce(Map<String, Object> request) {
         ModelProfile profile = registry.getProfile();
         String requestId = "chatcmpl-" + UUID.randomUUID().toString().substring(0, 8);
         registry.requestStarted(); // 计入活跃请求数（/health 会展示）
@@ -58,11 +63,19 @@ public class ChatController {
         String content = gen.generate(profile);
         long latencyMs = gen.simulateLatency(profile, content);
 
-        // 2. 故障注入：命中错误率时，睡满延迟再抛异常（模拟“上游处理中挂掉”）
+        // 2. 故障注入：命中错误率时，睡满延迟再返回错误（模拟"上游处理中挂掉"）
         if (gen.shouldFail(profile)) {
             sleep(latencyMs);
             registry.requestFinished();
-            throw new RuntimeException("Mock model internal error");
+            // V3：按 errorStatus 返回对应错误码；429 带 Retry-After 头（演示 H1 的 429 重试）
+            if (profile.errorStatus() == 429 && profile.retryAfterSeconds() > 0) {
+                return ResponseEntity.status(429)
+                        .header("Retry-After", String.valueOf(profile.retryAfterSeconds()))
+                        .body(Map.of("error", Map.of(
+                                "type", "rate_limit_error",
+                                "message", "mock rate limited")));
+            }
+            throw new RuntimeException("Mock model internal error (status=" + profile.errorStatus() + ")");
         }
 
         // 3. 正常路径：模拟推理延迟后返回 OpenAI 非流式格式
@@ -97,7 +110,7 @@ public class ChatController {
         String requestId = "chatcmpl-" + UUID.randomUUID().toString().substring(0, 8);
         String content = gen.generate(profile);
 
-        // 故障注入：流式在“首字节前”失败，正好演示网关 H3/H2 的首字节前切换
+        // 故障注入：流式在"首字节前"失败，正好演示网关的首字节前切换
         if (gen.shouldFail(profile)) {
             throw new RuntimeException("Mock model internal error");
         }
@@ -108,15 +121,37 @@ public class ChatController {
         Thread.ofVirtual().name("mock-sse-" + requestId).start(() -> {
             registry.requestStarted();
             try {
+                int sent = 0;
                 for (String token : tokens) {
                     emitter.send(buildChunk(requestId, profile.name(), token, false));
+                    sent++;
+                    // V3 故障注入：发送 N 个 chunk 后异常断开（演示网关 stream_interrupted 与 mock 断连日志）
+                    if (profile.streamFailAfterChunks() >= 0 && sent == profile.streamFailAfterChunks()) {
+                        throw new RuntimeException("mock stream broken after " + sent + " chunks");
+                    }
+                    // V3 故障注入：发送 N 个 chunk 后停顿（演示网关空闲超时被触发）
+                    if (profile.streamStallAfterChunks() >= 0 && sent == profile.streamStallAfterChunks()) {
+                        Thread.sleep(profile.streamStallMs());
+                    }
+                    // V3 故障注入：发送 N 个 chunk 后发错误事件并正常结束（演示错误事件透传）
+                    if (profile.streamErrorAfterChunks() >= 0 && sent == profile.streamErrorAfterChunks()) {
+                        emitter.send(Map.of("error", Map.of(
+                                "type", "upstream_error",
+                                "message", "mock stream error event")));
+                        emitter.complete();
+                        return;
+                    }
                     Thread.sleep((long) profile.streamingDelayMs()); // 模拟生成速率
                 }
                 // 结束 chunk：delta 为空 + finish_reason=stop
                 emitter.send(buildChunk(requestId, profile.name(), "", true));
                 emitter.complete();
+            } catch (IOException e) {
+                // 客户端断开（演示 C）：打印断连日志，证明网关取消了上游、mock 释放了连接
+                System.out.printf("[Mock %s] 客户端断开，取消生成 requestId=%s%n",
+                        profile.name(), requestId);
             } catch (Exception e) {
-                emitter.completeWithError(e); // 客户端断开等异常 → 错误结束
+                emitter.completeWithError(e); // 其它异常 → 错误结束（含流式中途断开故障注入）
             } finally {
                 registry.requestFinished();
             }

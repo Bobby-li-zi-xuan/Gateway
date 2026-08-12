@@ -61,6 +61,70 @@ public class GatewayMetrics {
                 .increment(dropped);
     }
 
+    // ── V3 增量：容错事件指标（详细实施计划 15.1）──
+
+    /** 重试事件：gateway_retry_total{instance,reason}（设计文档 7.2 的 retry_total{from,to,reason}） */
+    public void retry(String instanceId, String reason) {
+        Counter.builder("gateway.retry.total")
+                .tag("instance", instanceId)
+                .tag("reason", reason)
+                .register(meterRegistry).increment();
+    }
+
+    /** 降级事件：gateway_fallback_events{from,reason}（换候选时记录） */
+    public void fallback(String fromInstance, String reason) {
+        Counter.builder("gateway.fallback.events")
+                .tag("from", fromInstance)
+                .tag("reason", reason)
+                .register(meterRegistry).increment();
+    }
+
+    /** 超时事件：gateway_timeout_total{instance,stage}（stage=connect/request/first_byte/idle/total） */
+    public void timeout(String instanceId, String stage) {
+        Counter.builder("gateway.timeout.total")
+                .tag("instance", instanceId)
+                .tag("stage", stage)
+                .register(meterRegistry).increment();
+    }
+
+    /** 熔断转换：gateway_circuit_breaker_events{instance,to}（to=open/half_open/close） */
+    public void circuitEvent(String instanceId, String to) {
+        Counter.builder("gateway.circuit.breaker.events")
+                .tag("instance", instanceId)
+                .tag("to", to)
+                .register(meterRegistry).increment();
+    }
+
+    /** 熔断拒绝：gateway_circuit_breaker_rejections{instance}（快速失败次数） */
+    public void circuitRejected(String instanceId) {
+        Counter.builder("gateway.circuit.breaker.rejections")
+                .tag("instance", instanceId)
+                .register(meterRegistry).increment();
+    }
+
+    /** 冷却事件：gateway_cooldown_events{channel,to}（to=enter/exit） */
+    public void cooldownEvent(String channelId, String to) {
+        Counter.builder("gateway.cooldown.events")
+                .tag("channel", channelId)
+                .tag("to", to)
+                .register(meterRegistry).increment();
+    }
+
+    /** 冷却跳过：gateway_cooldown_skipped_total{channel}（候选被冷却剔除次数） */
+    public void cooldownSkipped(String channelId) {
+        Counter.builder("gateway.cooldown.skipped_total")
+                .tag("channel", channelId)
+                .register(meterRegistry).increment();
+    }
+
+    /** 流式取消：gateway_stream_cancelled{model,instance}（客户端断开，不算失败） */
+    public void streamCancelled(String alias, String instanceId) {
+        Counter.builder("gateway.stream.cancelled")
+                .tag("model", alias)
+                .tag("instance", instanceId)
+                .register(meterRegistry).increment();
+    }
+
     /** 构建（或复用）一个带固定标签的计数器；重复调用 register 会自动复用同名指标 */
     private Counter counter(String name, String alias, String instance, String result) {
         return Counter.builder(name)

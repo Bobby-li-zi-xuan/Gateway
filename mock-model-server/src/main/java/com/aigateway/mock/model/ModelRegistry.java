@@ -15,7 +15,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   缺省回退到 qwen-small；
  * - profile 是 volatile 引用：BehaviorController 写、请求线程读，保证可见性；
  * - healthy 用 volatile 布尔：健康开关即时生效；
- * - requestCounter 用 AtomicInteger：并发请求下安全地增/减活跃数。
+ * - requestCounter 用 AtomicInteger：并发请求下安全地增/减活跃数；
+ * - V3：每个 setter 都是"基于旧画像生成新画像再替换引用"，保持 record 不可变性。
  */
 @Component
 public class ModelRegistry {
@@ -42,21 +43,24 @@ public class ModelRegistry {
                     "qwen-large", "Qwen2.5-72B", 2000L, 0.0,
                     50.0, 8, 2, 0.55, 0.60,
                     "ANALYSIS",
-                    Map.of("codingAbility", "MEDIUM", "reasoningLevel", "HIGH")
+                    Map.of("codingAbility", "MEDIUM", "reasoningLevel", "HIGH"),
+                    500, 0, -1, -1, 0, -1
             );
             // deepseek-code：代码型，延迟低、流式快
             case "deepseek-code" -> new ModelProfile(
                     "deepseek-code", "DeepSeek-Coder-V2", 500L, 0.0,
                     15.0, 12, 1, 0.45, 0.50,
                     "CODE",
-                    Map.of("codingAbility", "MAX", "reasoningLevel", "MEDIUM")
+                    Map.of("codingAbility", "MAX", "reasoningLevel", "MEDIUM"),
+                    500, 0, -1, -1, 0, -1
             );
             // 默认 qwen-small：聊天型，最快
             default -> new ModelProfile(
                     "qwen-small", "Qwen2.5-14B", 200L, 0.0,
                     5.0, 5, 0, 0.30, 0.35,
                     "CHAT",
-                    Map.of("codingAbility", "LOW", "reasoningLevel", "LOW")
+                    Map.of("codingAbility", "LOW", "reasoningLevel", "LOW"),
+                    500, 0, -1, -1, 0, -1
             );
         };
     }
@@ -76,14 +80,17 @@ public class ModelRegistry {
     }
 
     // ---- 以下方法支持 /mock/behavior 动态修改行为 ----
-    // 每次都是“基于旧画像生成新画像再替换引用”，保持 record 不可变性
+    // 每次都是"基于旧画像生成新画像再替换引用"，保持 record 不可变性
 
     public void setErrorRate(double rate) {
         this.profile = new ModelProfile(
                 profile.name(), profile.version(), profile.baseLatencyMs(), rate,
                 profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
                 profile.gpuUsage(), profile.memoryUsage(),
-                profile.responseStyle(), profile.metadata()
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
         );
     }
 
@@ -92,7 +99,10 @@ public class ModelRegistry {
                 profile.name(), profile.version(), ms, profile.errorRate(),
                 profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
                 profile.gpuUsage(), profile.memoryUsage(),
-                profile.responseStyle(), profile.metadata()
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
         );
     }
 
@@ -101,7 +111,84 @@ public class ModelRegistry {
                 profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
                 profile.streamingDelayMs(), count, profile.queueSize(),
                 profile.gpuUsage(), profile.memoryUsage(),
-                profile.responseStyle(), profile.metadata()
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
+        );
+    }
+
+    // ---- V3 新增：故障注入参数 setter ----
+
+    public void setErrorStatus(int status) {
+        this.profile = new ModelProfile(
+                profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
+                profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
+                profile.gpuUsage(), profile.memoryUsage(),
+                profile.responseStyle(), profile.metadata(),
+                status, profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
+        );
+    }
+
+    public void setRetryAfterSeconds(int seconds) {
+        this.profile = new ModelProfile(
+                profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
+                profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
+                profile.gpuUsage(), profile.memoryUsage(),
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), seconds,
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
+        );
+    }
+
+    public void setStreamFailAfterChunks(int chunks) {
+        this.profile = new ModelProfile(
+                profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
+                profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
+                profile.gpuUsage(), profile.memoryUsage(),
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                chunks, profile.streamStallAfterChunks(),
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
+        );
+    }
+
+    public void setStreamStallAfterChunks(int chunks) {
+        this.profile = new ModelProfile(
+                profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
+                profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
+                profile.gpuUsage(), profile.memoryUsage(),
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), chunks,
+                profile.streamStallMs(), profile.streamErrorAfterChunks()
+        );
+    }
+
+    public void setStreamStallMs(long ms) {
+        this.profile = new ModelProfile(
+                profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
+                profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
+                profile.gpuUsage(), profile.memoryUsage(),
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                ms, profile.streamErrorAfterChunks()
+        );
+    }
+
+    public void setStreamErrorAfterChunks(int chunks) {
+        this.profile = new ModelProfile(
+                profile.name(), profile.version(), profile.baseLatencyMs(), profile.errorRate(),
+                profile.streamingDelayMs(), profile.activeRequests(), profile.queueSize(),
+                profile.gpuUsage(), profile.memoryUsage(),
+                profile.responseStyle(), profile.metadata(),
+                profile.errorStatus(), profile.retryAfterSeconds(),
+                profile.streamFailAfterChunks(), profile.streamStallAfterChunks(),
+                profile.streamStallMs(), chunks
         );
     }
 
