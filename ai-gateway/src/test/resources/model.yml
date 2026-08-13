@@ -13,6 +13,23 @@ gateway:
     errorRateAlpha: 0.1
     defaultOutputTokens: 256
 
+  # V4：集成测试默认旁路治理（V1~V3 场景原样回归）；
+  # V4 治理场景（T14）用独立网关实例以 property 覆盖 enabled=true。
+  governance:
+    enabled: false
+    db:
+      url: jdbc:h2:mem:gateway   # 内存库：并行测试不锁文件库（H2 文件模式单进程限制）
+      user: sa
+      password: ""
+
+  # V3 遗留修复：集成测试用例间的熔断窗口顺序耦合——
+  # mockAAt100PercentFailure（mock-a 3 次失败样本）+ mockBDown（mock-a 2 次成功样本）
+  # = 5 个样本 ≥ 默认 minimumRequests=5 且失败率 60% ≥ 50% 阈值 → mock-a 熔断 OPEN 30s，
+  # 后续用例全部 503 circuit_open。调高样本门槛，隔离用例间熔断状态（回归语义不变）。
+  execution:
+    circuitBreaker:
+      minimumRequests: 20
+
   health:
     intervalSeconds: 1
     timeoutMs: 2000

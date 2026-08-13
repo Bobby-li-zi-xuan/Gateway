@@ -3,6 +3,7 @@ package com.aigateway.core.service;
 import com.aigateway.api.dto.ChatChunk;
 import com.aigateway.api.dto.ChatCompletion;
 import com.aigateway.api.dto.ChatRequest;
+import com.aigateway.core.domain.model.ModelInstance;
 import com.aigateway.execution.fallback.ExecutionChainResolver;
 import com.aigateway.execution.fallback.FallbackChainExecutor;
 import com.aigateway.execution.stream.StreamProxy;
@@ -39,12 +40,18 @@ public class ChatGatewayService {
     }
 
     /** 非流式入口：解析候选链 → 降级链执行器（重试/超时/熔断/冷却/降级在内部） */
-    public ChatCompletion complete(ChatRequest request, String requestId,
-                                   Map<String, String> metadata) {
+    public ChatResult complete(ChatRequest request, String requestId,
+                               Map<String, String> metadata) {
         return fallbackExecutor.execute(
                 chainResolver.resolve(request, requestId, metadata),
                 request, requestId, metadata);
     }
+
+    /**
+     * 执行结果携带实际使用的实例（V4 计量需要 instance 的单价表与渠道/模型维度；
+     * 对照《版本4-详细实施计划》14.4）。
+     */
+    public record ChatResult(ChatCompletion completion, ModelInstance instance) {}
 
     /** 流式入口：解析候选链 → 流式代理（SSE 规范化 / 首字节边界 / 取消上游） */
     public void stream(ChatRequest request, String requestId, Map<String, String> metadata,

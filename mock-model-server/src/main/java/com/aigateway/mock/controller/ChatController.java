@@ -67,15 +67,15 @@ public class ChatController {
         if (gen.shouldFail(profile)) {
             sleep(latencyMs);
             registry.requestFinished();
-            // V3：按 errorStatus 返回对应错误码；429 带 Retry-After 头（演示 H1 的 429 重试）
+            // V3：按 errorStatus 返回对应状态码（502/503/504 验证网关 5xx 分类与降级）；
+            // 429 时附加 Retry-After 头（演示 H1 的 429 重试）
+            ResponseEntity.BodyBuilder builder = ResponseEntity.status(profile.errorStatus());
             if (profile.errorStatus() == 429 && profile.retryAfterSeconds() > 0) {
-                return ResponseEntity.status(429)
-                        .header("Retry-After", String.valueOf(profile.retryAfterSeconds()))
-                        .body(Map.of("error", Map.of(
-                                "type", "rate_limit_error",
-                                "message", "mock rate limited")));
+                builder.header("Retry-After", String.valueOf(profile.retryAfterSeconds()));
             }
-            throw new RuntimeException("Mock model internal error (status=" + profile.errorStatus() + ")");
+            return builder.body(Map.of("error", Map.of(
+                    "type", profile.errorStatus() == 429 ? "rate_limit_error" : "upstream_error",
+                    "message", "mock error status=" + profile.errorStatus())));
         }
 
         // 3. 正常路径：模拟推理延迟后返回 OpenAI 非流式格式
@@ -123,7 +123,8 @@ public class ChatController {
             try {
                 int sent = 0;
                 for (String token : tokens) {
-                    emitter.send(buildChunk(requestId, profile.name(), token, false));
+                    // 中间 chunk：usage 传 null（与 V1 行为一致，只最后一块带 usage）
+                    emitter.send(buildChunk(requestId, profile.name(), token, false, null));
                     sent++;
                     // V3 故障注入：发送 N 个 chunk 后异常断开（演示网关 stream_interrupted 与 mock 断连日志）
                     if (profile.streamFailAfterChunks() >= 0 && sent == profile.streamFailAfterChunks()) {
@@ -143,8 +144,11 @@ public class ChatController {
                     }
                     Thread.sleep((long) profile.streamingDelayMs()); // 模拟生成速率
                 }
-                // 结束 chunk：delta 为空 + finish_reason=stop
-                emitter.send(buildChunk(requestId, profile.name(), "", true));
+                // 结束 chunk：delta 为空 + finish_reason=stop + usage（V4 计量：与网关同口径估算）
+                emitter.send(buildChunk(requestId, profile.name(), "", true, Map.of(
+                        "prompt_tokens", estimateTokens(request),
+                        "completion_tokens", estimateTextTokens(content),
+                        "total_tokens", estimateTokens(request) + estimateTextTokens(content))));
                 emitter.complete();
             } catch (IOException e) {
                 // 客户端断开（演示 C）：打印断连日志，证明网关取消了上游、mock 释放了连接
@@ -171,23 +175,29 @@ public class ChatController {
     /**
      * 构造一个 OpenAI 流式 chunk：
      * - delta 是增量文本（结束 chunk 为 null 值空 map）；
-     * - finish_reason 只在结束 chunk 出现（OpenAI 协议中间 chunk 为 null/缺省）。
-     * 注意：Map.of 不允许 null 值，所以这里用 HashMap 按需放入 finish_reason。
+     * - finish_reason 只在结束 chunk 出现（OpenAI 协议中间 chunk 为 null/缺省）；
+     * - usage 只在结束 chunk 出现（V4 计量用），由调用方计算传入（方法参数只有
+     *   id/model/delta/isLast，不能在这里引用方法外的 request / content）。
+     * 注意：Map.of 不允许 null 值，所以这里用 HashMap 按需放入 finish_reason / usage。
      */
-    private Map<String, Object> buildChunk(String id, String model, String delta, boolean isLast) {
+    private Map<String, Object> buildChunk(String id, String model, String delta,
+                                           boolean isLast, Map<String, Object> usage) {
         Map<String, Object> choice = new HashMap<>();
         choice.put("index", 0);
         choice.put("delta", delta.isEmpty() ? Map.of() : Map.of("content", delta));
         if (isLast) {
             choice.put("finish_reason", "stop");
         }
-        return Map.of(
-                "id", id,
-                "object", "chat.completion.chunk",
-                "created", System.currentTimeMillis() / 1000,
-                "model", model,
-                "choices", List.of(choice)
-        );
+        Map<String, Object> chunk = new HashMap<>();
+        chunk.put("id", id);
+        chunk.put("object", "chat.completion.chunk");
+        chunk.put("created", System.currentTimeMillis() / 1000);
+        chunk.put("model", model);
+        chunk.put("choices", List.of(choice));
+        if (isLast && usage != null) {
+            chunk.put("usage", usage);
+        }
+        return chunk;
     }
 
     /**

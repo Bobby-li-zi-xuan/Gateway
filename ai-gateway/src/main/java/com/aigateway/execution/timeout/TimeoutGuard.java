@@ -44,9 +44,14 @@ public final class TimeoutGuard implements AutoCloseable {
     /** 注册一个一次性定时器（首字节 / 空闲都用它）；guard 已关闭则忽略 */
     public void scheduleOnce(long delayMs, Runnable action) {
         if(closed.get()) return ;
-        timers.add(scheduler.schedule(() ->{
+        ScheduledFuture<?> future = scheduler.schedule(() ->{
             if(!closed.get()) action.run();
-        }, delayMs, TimeUnit.MILLISECONDS));
+        }, delayMs, TimeUnit.MILLISECONDS);
+        timers.add(future);
+        // close() 与 scheduleOnce 竞态：检查通过后 close() 已清空 timers 并置位，
+        // 刚注册的任务不会被取消（回调有 !closed 防护不执行动作，但任务本身泄漏）。
+        // 注册后复查一次：已关闭则立即取消，避免泄漏一次性任务。
+        if(closed.get()) future.cancel(false);
     }
 
     /** 取消全部定时器（收到首字节 / 正常结束时调用） */

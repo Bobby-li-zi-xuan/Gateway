@@ -1,20 +1,47 @@
 package com.aigateway.execution.timeout;
 
+import org.junit.jupiter.api.Test;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
 /**
- * ⚠️ H2 单测骨架（详细实施计划 18.1 H2 行）：
- * TimeoutGuard 未手敲前（方法抛 TODO 异常）本组用例无法通过，H2 完成后逐个启用。
+ * H2 单测（详细实施计划 18.1 H2 行）：超时守卫三件事——
+ * 总时长过期判定、预算内睡眠、close() 后定时器不再执行。
  *
- * 待写用例（对照计划 18.1 表格）：
- * 1. totalExpiry_shouldReportExpiredAndZeroRemaining：总时长过期 → expired()=true、
- *    remainingMs()=0（用短时长构造，如 totalMs=50 + sleep 60）；
- * 2. sleepWithinBudget_shouldRespectBudget：预算足够 → sleep 成功返回 true；
- *    预算不足 → 返回 false；
- * 3. timersCancelled_afterClose：close() 后 scheduleOnce 不再执行回调
- *    （AtomicBoolean 标记 + 短延迟 + 短暂等待断言）。
- *
- * 依赖说明：ScheduledExecutorService 用真实调度器（Executors.newScheduledThreadPool）。
+ * 依赖说明：ScheduledExecutorService 用真实调度器。
  */
 class TimeoutGuardTest {
 
-    // TODO H2: 构造 TimeoutGuard（短 totalMs 避免测试慢）并编写上述用例
+    @Test
+    void totalExpiry_shouldReportExpiredAndZeroRemaining() throws InterruptedException {
+        try (TimeoutGuard guard = new TimeoutGuard(50, Executors.newScheduledThreadPool(1))) {
+            Thread.sleep(80);
+            assertThat(guard.expired()).isTrue();
+            assertThat(guard.remainingMs()).isZero();
+        }
+    }
+
+    @Test
+    void sleepWithinBudget_shouldRespectBudget() {
+        try (TimeoutGuard guard = new TimeoutGuard(60_000, Executors.newScheduledThreadPool(1))) {
+            // 预算足够 → 正常睡完返回 true
+            assertThat(guard.sleepWithinBudget(10)).isTrue();
+            // 预算不足 → 不睡直接返回 false（调用方应放弃）
+            assertThat(guard.sleepWithinBudget(61_000)).isFalse();
+        }
+    }
+
+    @Test
+    void timersCancelled_afterClose() throws InterruptedException {
+        try (TimeoutGuard guard = new TimeoutGuard(60_000, Executors.newScheduledThreadPool(1))) {
+            AtomicBoolean fired = new AtomicBoolean();
+            guard.scheduleOnce(20, () -> fired.set(true));
+            guard.close();
+            Thread.sleep(60);
+            assertThat(fired).isFalse();
+        }
+    }
 }

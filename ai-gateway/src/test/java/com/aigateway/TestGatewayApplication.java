@@ -13,6 +13,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  *
  * V2 增量：新增 decision（决策引擎）与 plugin（插件框架）两个子包，
  * 否则脚手架 bean（PolicyManager / PluginRegistry / DecisionLogStore 等）不会被扫描注册。
+ * V4 增量：新增 governance（令牌/限流/预算/计量/渠道/持久化）。
  */
 @SpringBootApplication(scanBasePackages = {
         "com.aigateway.api",
@@ -22,7 +23,8 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
         "com.aigateway.plugin",
         "com.aigateway.state",
         "com.aigateway.execution",
-        "com.aigateway.observability"
+        "com.aigateway.observability",
+        "com.aigateway.governance"
 })
 public class TestGatewayApplication {
 }

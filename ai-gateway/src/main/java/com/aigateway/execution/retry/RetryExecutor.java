@@ -14,9 +14,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * ⚠️ 手敲 H1（详细实施计划第 8 节 S6）——本类全部逻辑需手敲，方法体当前抛 TODO 异常。
- *
- * 重试执行器：只处理"同实例重试"的决策，不负责换候选（降级链在外层）。
+ * 重试执行器（对照详细实施计划第 8 节 S6）：只处理"同实例重试"的决策，不负责换候选（降级链在外层）。
  *
  * 手敲要点（对照计划 8.2）：
  * - 同实例重试只有两种情形：连接级失败（CONNECTION，可配）与 429 + Retry-After（可配）；
@@ -24,8 +22,8 @@ import org.springframework.stereotype.Component;
  * - 等待时长：429 优先听上游 Retry-After（上限 maxRetryAfterMs）；
  *   连接失败用指数退避 min(base × 2^n, max) + 随机抖动；
  * - 所有等待受 TimeoutGuard 总时长预算约束（sleepWithinBudget 返回 false 即放弃）；
- * - 安全边界：本类不知道"流式首字节"的存在，首字节语义由 StreamProxy（H6）更外层把关；
- * - 同实例最多重试一次（attemptNo >= 1 即停）。
+ * - 安全边界：本类不知道“流式首字节”的存在，首字节语义由 StreamProxy（H6）更外层把关；
+ * - 同实例重试次数受 maxAttemptsPerCandidate 约束（默认 1 = 不重试同实例）。
  */
 @Component
 public class RetryExecutor {
@@ -84,9 +82,11 @@ public class RetryExecutor {
      * - 连接级失败：连接都没建立，重打一次是安全的（默认允许）；
      * - 429 + Retry-After：上游明确告诉你“等多久再试”（默认允许）。
      * 其余一律不重试同实例——重试 = 换候选，由外层完成。
+     * 总尝试次数受 maxAttemptsPerCandidate 约束：默认 1 = 首次失败后不再重试；
+     * 配置为 N 时最多 N-1 次同实例重试（attemptNo 0 起，达到 N-1 即停）。
      */
     private boolean shouldRetrySameInstance(RetryPolicy policy, Failure f, int attemptNo){
-        if(attemptNo >= 1) return false;
+        if(attemptNo >= policy.maxAttemptsPerCandidate() - 1) return false;
         if(!f.retryable()) return false;
         if(f.type() == FailureType.CONNECTION){
             return policy.sameInstanceOnConnectionFailure();

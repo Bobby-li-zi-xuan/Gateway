@@ -7,6 +7,7 @@ import com.aigateway.decision.model.ModelState;
 import com.aigateway.decision.model.ScoreFactors;
 import com.aigateway.decision.model.ScoringDetail;
 import com.aigateway.decision.state.ModelStateStore;
+import com.aigateway.governance.meter.TokenEstimator;
 import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.plugin.context.Signals;
 import com.aigateway.state.health.HealthChecker;
@@ -107,32 +108,12 @@ public class Scorer {
 
     /** 成本预估：input 用请求消息估算，output 用 maxTokens 或默认值（V4 换成真实计量） */
     private double estimateCost(ModelInstance inst, ChatRequest request) {
-        long inputTokens = estimateInputTokens(request);  // 与 CapabilityFilter 同款私有估算（见 9.2）
+        long inputTokens = TokenEstimator.estimateInputTokens(request,
+                TokenEstimator.DEFAULT_CHARS_PER_TOKEN, TokenEstimator.DEFAULT_CJK_TOKEN_PER_CHAR);
         int outputTokens = request.maxTokens() != null
                 ? request.maxTokens() : props.getDecision().getDefaultOutputTokens();
         return inputTokens / 1000.0 * inst.priceIn()
                 + outputTokens / 1000.0 * inst.priceOut();
-    }
-
-    /** 输入 token 估算：与 CapabilityFilter 同一实现（暂不抽公共工具）、与 mock 口径一致 */
-    private static long estimateInputTokens(ChatRequest request) {
-        if (request.messages() == null) return 1;
-        long tokens = request.messages().stream()
-                .map(ChatRequest.Message::content)
-                .filter(s -> s != null)
-                .mapToLong(Scorer::estimateTextTokens)
-                .sum();
-        return Math.max(1, tokens);
-    }
-
-    /** 文本 → token 近似：CJK 字符约 1 字/token，其余约 4 字符/token（与 CapabilityFilter/mock 同款） */
-    private static long estimateTextTokens(String text) {
-        long cjk = 0, other = 0;
-        for (char c : text.toCharArray()) {
-            if (Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN) cjk++;
-            else other++;
-        }
-        return cjk + (other + 3) / 4;
     }
 
     /**

@@ -1,9 +1,13 @@
-# 网关配置（V3 完整结构，对照《版本3-详细实施计划》第 5.1 节）
+# 网关配置（V4 完整结构，对照《版本4-详细实施计划》第 5.1 节）
 #
 # V1 结构（health / channels / models）保留；V2 新增 decision / policies / plugins；
 # V3 新增：
 # - gateway.execution：容错治理参数（重试 / 分层超时 / 熔断 / 冷却，全部有缺省）
 # - channels[].timeout：渠道级超时覆盖（可选，不配则用 execution.defaultTimeout）
+# V4 新增：
+# - gateway.governance：治理参数（鉴权 / 限流 / 配额 / 计量 / 批量落库，全部有缺省）
+# - gateway.tokens：启动种子令牌（演示用，可空；无令牌时自动创建演示令牌）
+# - plugins 追加 governance-bootstrap（BEFORE_DECISION 写治理信号，order=100 最先执行）
 gateway:
   health:
     intervalSeconds: 5
@@ -48,6 +52,28 @@ gateway:
     errorRateAlpha: 0.1
     defaultOutputTokens: 256
 
+  governance:                   # ── V4 新增：治理参数（对照详细计划 5.1）──
+    enabled: true               # 总开关：false = 跳过鉴权与限流（演示旁路用）
+    db:
+      url: jdbc:h2:file:./data/gateway    # 文件模式；测试用 jdbc:h2:mem:gateway
+      user: sa
+      password: ""
+    estimation:                 # 近似计量系数（CJK 1 字/token，其他约 4 字符/token）
+      charsPerToken: 4.0
+      cjkTokenPerChar: 1.0
+    rateLimit:                  # 限流（管速度）
+      defaultQps: 100           # 令牌级缺省 QPS（滑动窗口 1s）
+      defaultRpm: 6000          # 令牌级缺省 RPM（滑动窗口 60s）
+      tokenRate:                # Token 速率限流（可选）：预扣预估输入、结束按实际修正
+        enabled: false
+        perSecondTokens: 20000
+    budget:                     # 配额（管总量）
+      warnRatios: [ 0.7, 0.9 ]  # 预警阈值（软预算，不阻断）
+      exceedAction: REJECT      # 超额动作：REJECT（拒绝）/ DEGRADE（降级到低成本候选）
+    usageFlush:                 # 用量批量落库
+      intervalMs: 5000          # 定时 flush 周期
+      batchSize: 100            # 单批最大条数（达到即刷）
+
   channels:
     - id: mock-a
       provider: openai-compatible
@@ -73,8 +99,8 @@ gateway:
         - channelId: mock-a
           model: qwen-large
           weight: 8
-          priceIn: 0.001           # 每 1K input tokens 价格（美元），成本打分输入
-          priceOut: 0.002          # 每 1K output tokens 价格
+          priceIn: 0.002           # V4 价格修正：qwen-large 贵且好（单次 256 输出约 $0.001）
+          priceOut: 0.004          # 每 1K output tokens 价格
           qualityScore: 0.9        # 0~1 静态质量分
           latencyProfileMs: 2000   # EWMA 初始延迟，与实际 mock 延迟一致
           capability:
@@ -87,8 +113,8 @@ gateway:
         - channelId: mock-b
           model: qwen-small
           weight: 2
-          priceIn: 0.01
-          priceOut: 0.02
+          priceIn: 0.0005          # V4 价格修正：qwen-small 便宜且快（单次 256 输出约 $0.00026）
+          priceOut: 0.001          # 低成本候选真实存在，成本降级演示（21.4）依赖此配置
           qualityScore: 0.4
           latencyProfileMs: 200
           capability:
@@ -160,3 +186,16 @@ gateway:
       order: 10
       config:
         enabled: false
+    - name: governance-bootstrap  # ── V4 新增：BEFORE_DECISION 写治理信号（必须最先执行）──
+      scope: GLOBAL
+      order: 100                 # 数字大先执行：信号要赶在过滤器读信号之前
+      config: {}
+
+  tokens:                        # ── V4 新增：启动种子令牌（演示用，可空）──
+    - name: demo
+      quotaLimit: 1.0            # 额度上限（美元，-1 = 无限）；TOKEN 类型则写 token 数
+      quotaType: COST
+      modelScope: ""             # 空 = 不限；逗号分隔的 alias 列表
+      ipWhitelist: ""            # 空 = 不限；逗号分隔的 IP 列表
+      expiresAt: -1              # epoch 毫秒；-1 = 永不过期
+      enabled: true

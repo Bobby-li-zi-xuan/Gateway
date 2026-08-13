@@ -1,7 +1,9 @@
 package com.aigateway.observability;
 
 import com.aigateway.decision.model.RoutingDecision;
+import com.aigateway.governance.model.MeteredUsage;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
 
@@ -123,6 +125,62 @@ public class GatewayMetrics {
                 .tag("model", alias)
                 .tag("instance", instanceId)
                 .register(meterRegistry).increment();
+    }
+
+    // ── V4 增量：治理与计量指标（详细实施计划 17.1）──
+
+    /** 令牌生命周期：gateway_tokens_created_total / gateway_tokens_revoked_total */
+    public void tokenCreated() {
+        Counter.builder("gateway.tokens.created").register(meterRegistry).increment();
+    }
+    public void tokenRevoked() {
+        Counter.builder("gateway.tokens.revoked").register(meterRegistry).increment();
+    }
+
+    /** 限流拒绝：gateway_rate_limit_rejections_total{dimension} */
+    public void rateLimited(String dimension) {
+        Counter.builder("gateway.rate.limit.rejections")
+                .tag("dimension", dimension)
+                .register(meterRegistry).increment();
+    }
+
+    /** 预算预警：gateway_budget_warnings_total{scope,value}（软预算，不阻断） */
+    public void budgetWarning(String scope, String value) {
+        Counter.builder("gateway.budget.warnings")
+                .tag("scope", scope).tag("value", value)
+                .register(meterRegistry).increment();
+    }
+
+    /** 预算拒绝：gateway_budget_rejections_total{scope}（429 budget_exceeded 次数） */
+    public void budgetRejected(String scope) {
+        Counter.builder("gateway.budget.rejections")
+                .tag("scope", scope)
+                .register(meterRegistry).increment();
+    }
+
+    /** 用量与成本：gateway_usage_tokens_total{type}（in/out 累计）、gateway_usage_cost_total（美元） */
+    public void usage(MeteredUsage usage, boolean success) {
+        Counter.builder("gateway.usage.tokens").tag("type", "in")
+                .register(meterRegistry).increment(usage.tokenIn());
+        Counter.builder("gateway.usage.tokens").tag("type", "out")
+                .register(meterRegistry).increment(usage.tokenOut());
+        Counter.builder("gateway.usage.cost")
+                .tag("result", success ? "success" : "failure")
+                .register(meterRegistry).increment(usage.cost());
+    }
+
+    /** 近似计量打点：gateway_meter_estimates_total{type}（estimated 次数 / 误差审计用） */
+    public void meterEstimated(boolean estimated) {
+        if (estimated) {
+            Counter.builder("gateway.meter.estimates").tag("type", "approximate")
+                    .register(meterRegistry).increment();
+        }
+    }
+
+    /** 待落库积压：gateway_ledger_pending（gauge，UsageLedger 定时上报） */
+    public void ledgerPending(int pending) {
+        Gauge.builder("gateway.ledger.pending", () -> pending)
+                .register(meterRegistry);
     }
 
     /** 构建（或复用）一个带固定标签的计数器；重复调用 register 会自动复用同名指标 */

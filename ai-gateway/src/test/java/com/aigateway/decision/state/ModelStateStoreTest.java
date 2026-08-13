@@ -3,6 +3,7 @@ package com.aigateway.decision.state;
 import com.aigateway.core.domain.model.ModelInstance;
 import com.aigateway.decision.model.ModelState;
 import com.aigateway.execution.model.CircuitState;
+import com.aigateway.execution.model.FailureType;
 import com.aigateway.infra.config.GatewayProperties;
 import com.aigateway.state.registry.ModelRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,16 +16,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
  * 状态闭环单测（V3 版，详细实施计划 18.1 H7）：
- * 脚手架部分（stateOf / beginRequest / endRequest）已可用；
- * apply(StateEvent) 相关用例需在 H7 手敲完成后启用（当前标注 TODO H7）。
- *
- * V2 → V3 变化：recordSuccess/recordFailure 已删除，统一改为事件入口
- * StateEventPipeline.flush() → ModelStateStore.apply(event)。
+ * 事件入口 apply(StateEvent) 的聚合语义——EWMA 延迟、错误率衰减、慢调用累计、
+ * 熔断状态快照、冷却按渠道广播、并发不丢更新。
  */
 class ModelStateStoreTest {
 
@@ -61,33 +60,49 @@ class ModelStateStoreTest {
         assertThat(store.stateOf(INSTANCE).inFlight()).isEqualTo(1);
     }
 
-    // ══ TODO H7（手敲完成后启用）══
-    // 以下用例的调用入口已改为事件管道，需 H7 实现 apply 后运行：
-
+    /** 连续成功：EWMA 延迟向样本收敛（α=0.3），错误率衰减 */
     @Test
     void consecutiveSuccess_shouldConvergeLatencyAndDecayErrorRate() {
-        // TODO H7: store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
-        //         → 错误率 > 0
-        // TODO H7: 连续 20 次 store.apply(new StateEvent.Success(INSTANCE, 200))
-        //         → EWMA 延迟向 200 收敛（α=0.3）、错误率 < 0.02
+        store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
+        assertThat(store.stateOf(INSTANCE).errorRate()).isEqualTo(0.1); // α=0.1
+
+        for (int i = 0; i < 20; i++) {
+            store.apply(new StateEvent.Success(INSTANCE, 200));
+        }
+        ModelState state = store.stateOf(INSTANCE);
+        assertThat(state.ewmaLatencyMs()).isLessThan(210.0);      // 向 200 收敛
+        assertThat(state.errorRate()).isLessThan(0.02);           // 0.1×0.9^20 ≈ 0.012
+        assertThat(state.totalCalls()).isEqualTo(21);             // 1 失败 + 20 成功
     }
 
+    /** 失败：错误率上滑（α=0.1）、延迟不动；慢调用/熔断事件各自更新对应字段 */
     @Test
     void failure_shouldSlideErrorRateTowardsOneWithoutTouchingLatency() {
-        // TODO H7: apply(Failure) 后错误率 = 0.1（α=0.1）、延迟不变
-        // TODO H7: apply(SlowCall) 后 slowCalls 累计、apply(CircuitTransition) 后 circuitState 更新
+        store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
+        ModelState afterFailure = store.stateOf(INSTANCE);
+        assertThat(afterFailure.errorRate()).isEqualTo(0.1);
+        assertThat(afterFailure.ewmaLatencyMs()).isEqualTo(1000.0);  // 失败样本不带延迟
+
+        store.apply(new StateEvent.SlowCall(INSTANCE, 12_000));
+        assertThat(store.stateOf(INSTANCE).slowCalls()).isEqualTo(1);
+
+        store.apply(new StateEvent.CircuitTransition(INSTANCE, CircuitState.CLOSED, CircuitState.OPEN));
+        assertThat(store.stateOf(INSTANCE).circuitState()).isEqualTo(CircuitState.OPEN);
     }
 
+    /** 冷却事件是渠道级：广播到该渠道全部实例；未知渠道不抛异常 */
     @Test
     void cooldownChange_shouldBroadcastToChannelInstances() {
-        // TODO H7: apply(new StateEvent.CooldownChange("mock-a", true, 30_000))
-        //         → 该渠道全部实例 cooling() == true；未知渠道不抛异常
+        store.apply(new StateEvent.CooldownChange("mock-a", true, 30_000));
+        assertThat(store.stateOf(INSTANCE).cooling()).isTrue();
+
+        assertThatCode(() -> store.apply(new StateEvent.CooldownChange("unknown-channel", true, 30_000)))
+                .doesNotThrowAnyException();
     }
 
+    /** 并发更新不丢：50 次失败并发 apply 后错误率 ≈ 1 - 0.9^50（单写者纪律：测试直接调 apply） */
     @Test
     void concurrentUpdates_shouldNotLoseState() throws InterruptedException {
-        // TODO H7: 多线程并发 offer(Failure) + flush() 后错误率接近 1 - 0.9^50
-        // （单写者纪律：测试里手动调用 flush() 代替定时器）
         int threads = 50;
         ExecutorService pool = Executors.newFixedThreadPool(8);
         CountDownLatch ready = new CountDownLatch(threads);
@@ -98,7 +113,7 @@ class ModelStateStoreTest {
                 ready.countDown();
                 try {
                     start.await();
-                    // TODO H7: store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
+                    store.apply(new StateEvent.Failure(INSTANCE, FailureType.HTTP_5XX));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 } finally {
@@ -111,6 +126,8 @@ class ModelStateStoreTest {
         assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
         pool.shutdown();
 
-        // TODO H7: 断言错误率 ≈ 1 - 0.9^50（若 apply 未实现，此断言不会执行）
+        // 错误率 EWMA：1 - 0.9^50 ≈ 0.9948（50 次失败后收敛到接近 1）
+        assertThat(store.stateOf(INSTANCE).errorRate()).isBetween(0.98, 1.0);
+        assertThat(store.stateOf(INSTANCE).totalCalls()).isEqualTo(50);  // 不丢更新
     }
 }

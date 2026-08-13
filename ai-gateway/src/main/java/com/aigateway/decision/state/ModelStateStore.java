@@ -13,19 +13,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * ⚠️ 手敲 H7（详细实施计划第 14 节 S12b）——apply() 需手敲，方法体当前抛 TODO 异常。
- *
- * 状态存储：EWMA 延迟 / 错误率（V2 已有算法）+ 熔断 / 冷却 / 慢调用快照（V3）。
+ * 状态存储（对照详细实施计划第 14 节 S12b）：EWMA 延迟 / 错误率（V2 已有算法）
+ * + 熔断 / 冷却 / 慢调用快照（V3）。
  * 只被 StateEventPipeline 的单写者线程更新；请求线程只读 stateOf()。
  *
- * 脚手架已实现：stateOf / beginRequest / endRequest（V2 语义保留，签名不变）。
- *
- * 手敲要点（对照计划 14.3）：
+ * 要点：
  * - apply(StateEvent) 用 ConcurrentHashMap.compute 原子应用五种事件（Success/Failure/
  *   SlowCall/CircuitTransition/CooldownChange），EWMA 公式 new = α×sample + (1−α)×old；
  * - CooldownChange 是渠道级事件：按渠道广播到旗下全部实例（registry.findByChannelId），
  *   compute 回调内禁止触碰同一 map 的其它键，实例列表必须在 compute 外取；
- * - ⚠️ V2 的 recordSuccess/recordFailure 已删除，统一改为事件入口（单写者纪律）。
+ * - V2 的 recordSuccess/recordFailure 已删除，统一改为事件入口（单写者纪律）。
  */
 @Component
 public class ModelStateStore {

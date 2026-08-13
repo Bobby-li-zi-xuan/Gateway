@@ -3,6 +3,7 @@ package com.aigateway.core.service;
 import com.aigateway.api.dto.ChatCompletion;
 import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.domain.model.ModelInstance;
+import com.aigateway.core.service.ChatGatewayService.ChatResult;
 import com.aigateway.execution.fallback.ExecutionChainResolver;
 import com.aigateway.execution.fallback.FallbackChainExecutor;
 import com.aigateway.execution.stream.StreamProxy;
@@ -60,12 +61,15 @@ class ChatGatewayServiceTest {
     @Test
     void complete_shouldResolveChainAndDelegateToFallbackExecutor() {
         List<ModelInstance> chain = List.of(instance("mock-a:qwen-large"), instance("mock-b:qwen-small"));
+        ModelInstance inst = instance("mock-a:qwen-large");
         when(chainResolver.resolve(any(), anyString(), any())).thenReturn(chain);
-        when(fallbackExecutor.execute(eq(chain), any(), anyString(), any())).thenReturn(COMPLETION);
+        when(fallbackExecutor.execute(eq(chain), any(), anyString(), any()))
+                .thenReturn(new ChatResult(COMPLETION, inst));
 
-        ChatCompletion result = service.complete(request(), "req-1", METADATA);
+        ChatResult result = service.complete(request(), "req-1", METADATA);
 
-        assertThat(result).isEqualTo(COMPLETION);
+        assertThat(result.completion()).isEqualTo(COMPLETION);
+        assertThat(result.instance()).isSameAs(inst);
         verify(chainResolver).resolve(request(), "req-1", METADATA);   // 链解析先执行
         verify(fallbackExecutor).execute(chain, request(), "req-1", METADATA); // 交给 H5
     }

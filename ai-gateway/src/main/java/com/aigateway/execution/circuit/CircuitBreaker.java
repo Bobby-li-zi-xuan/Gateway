@@ -6,9 +6,7 @@ import com.aigateway.execution.model.CircuitBreakerConfig;
 import com.aigateway.execution.model.CircuitState;
 
 /**
- * ⚠️ 手敲 H3（详细实施计划第 10 节 S8）——本类全部逻辑需手敲，方法体当前抛 TODO 异常。
- *
- * 单实例熔断器：滑动窗口（环形数组）统计最近 N 次结果。
+ * 单实例熔断器（对照详细实施计划第 10 节 S8）：滑动窗口（环形数组）统计最近 N 次结果。
  *
  * 手敲要点（对照计划 10.2）：
  * - 环形数组：写入 O(1)，旧样本自动被新样本挤出——这就是"滑动窗口"；
@@ -78,6 +76,12 @@ public final class CircuitBreaker {
     public StateTransition record(boolean success, long latencyMs, Long slowThresholdMs) {
         boolean slow = slowThresholdMs != null && latencyMs >= slowThresholdMs;
         synchronized(lock){
+            // OPEN 态迟到记录：allowRequest 放行后、打开前发出的存量请求此刻才返回——
+            // 不进窗口（污染统计）、不改 openUntilMs（防止打开期被刷新延长）、
+            // 返回无转换（from == to，避免 CLOSED→OPEN 事件重复发布）
+            if(state == CircuitState.OPEN){
+                return new StateTransition(state, state);
+            }
             //半开态：探测结果直接决定去向，不进窗口
             if(state == CircuitState.HALF_OPEN){
                 resetWindow();
@@ -88,6 +92,7 @@ public final class CircuitBreaker {
                 }
                 return new StateTransition(CircuitState.HALF_OPEN, state);
             }
+            // 锁内保证：能走到这里的一定是 CLOSED 态
             push(success, slow);
             // 样本足够且失败率 / 慢调用率任一超阈值 -> 打开
             if(filled >= config.minimumRequests() && (failureRate() >= config.failureRateThreshold()

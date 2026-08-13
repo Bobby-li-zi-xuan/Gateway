@@ -60,7 +60,7 @@ public class ChatCompletionController {
             return streamResponse(request, requestId, metadata(httpRequest));
         }
         // 非流式：阻塞等待上游返回完整结果（虚拟线程保证不占满系统线程）
-        ChatCompletion completion = gatewayService.complete(request, requestId, metadata(httpRequest));
+        ChatCompletion completion = gatewayService.complete(request, requestId, metadata(httpRequest)).completion();
         return ResponseEntity.ok(completion);
     }
 
@@ -108,6 +108,7 @@ public class ChatCompletionController {
     /**
      * 提取请求级容错 header 与 V2 的 tenant / canary_group（金丝雀插件 CanaryGroupPlugin 消费）。
      * 超时 header 值不在此校验（正整数校验在 ExecutionPolicyManager.parseHeader，失败 → 400）。
+     * V4：GovernanceFilter 校验通过后写入的令牌 ID 透传进 metadata（治理插件 / BudgetFilter / 计量共用）。
      */
     private Map<String, String> metadata(HttpServletRequest req) {
         Map<String, String> result = new HashMap<>();
@@ -117,6 +118,10 @@ public class ChatCompletionController {
                 .ifPresent(v -> result.put("x-gateway-idle-timeout-ms", v));
         result.put("tenant", header(req, "X-Tenant-Id").orElse("default"));
         result.put("canary_group", header(req, "X-Canary-Group").orElse("stable"));
+        Object tokenId = req.getAttribute("governance.tokenId");
+        if (tokenId != null) {
+            result.put("x-gateway-token-id", tokenId.toString());
+        }
         return Map.copyOf(result);
     }
 

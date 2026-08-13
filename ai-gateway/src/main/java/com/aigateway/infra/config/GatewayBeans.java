@@ -4,15 +4,14 @@ import com.aigateway.decision.state.StateEvent;
 import com.aigateway.decision.state.StateEventPipeline;
 import com.aigateway.execution.cooldown.CooldownManager;
 import com.aigateway.execution.policy.ExecutionPolicyManager;
-import com.aigateway.execution.stream.MeteringCallback;
 import com.aigateway.observability.GatewayMetrics;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
  * V3 装配类（脚手架接线，详细实施计划 11.2 / 13.3）：
- * - CooldownManager（H4）：接线层把冷却进出转成状态事件 + 指标（回调必须轻量、不抛异常）；
- * - MeteringCallback：缺省空实现，V4 接入 Token 累加时只需替换该 Bean 定义。
+ * - CooldownManager（H4）：接线层把冷却进出转成状态事件 + 指标（回调必须轻量、不抛异常）。
+ * - MeteringCallback：V4 起由 TokenMeter（H4，@Component）提供实现，此处不再定义缺省 Bean。
  */
 @Configuration
 public class GatewayBeans {
@@ -26,11 +25,5 @@ public class GatewayBeans {
             metrics.cooldownEvent(channelId, cooling ? "enter" : "exit");
         };
         return new CooldownManager(policyManager.defaults().cooldown(), listener);
-    }
-
-    /** 缺省计量回调：空实现。V4 接入 Token 累加时，只需替换该 Bean 定义 */
-    @Bean
-    public MeteringCallback meteringCallback() {
-        return new MeteringCallback() {};   // 使用接口默认方法（空实现）
     }
 }

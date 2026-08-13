@@ -13,13 +13,12 @@ import com.aigateway.execution.connector.OpenAIConnector;
 import com.aigateway.execution.cooldown.CooldownManager;
 import com.aigateway.execution.model.ExecutionPolicies;
 import com.aigateway.execution.model.Failure;
+import com.aigateway.execution.model.FailureType;
 import com.aigateway.execution.model.StreamSession;
 import com.aigateway.execution.model.UpstreamCallException;
 import com.aigateway.execution.policy.ExecutionPolicyManager;
 import com.aigateway.execution.timeout.TimeoutGuard;
 import com.aigateway.observability.GatewayMetrics;
-
-import io.micrometer.core.instrument.TimeGauge;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,9 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
- * ⚠️ 手敲 H6（详细实施计划第 13 节 S11）——本类全部逻辑需手敲，方法体当前抛 TODO 异常。
- *
- * 流式代理：在连接器之上做"治理"，连接器只负责低层 SSE 读取与超时关闭。
+ * 流式代理（对照详细实施计划第 13 节 S11）：在连接器之上做"治理"，连接器只负责低层 SSE 读取与超时关闭。
  *
  * 手敲要点（对照计划 13.2，本版本最难也最值钱的部分）：
  * 1. 逐 chunk 规范化（补齐 id/created/model，错误事件转统一错误体）；
@@ -126,7 +123,7 @@ public class StreamProxy {
             stateStore.beginRequest(candidate.instanceId());
             try {
                 StreamOutcome outcome = streamOnce(candidate, request, policies,
-                        requestId, started, consumer);
+                        requestId, metadata, started, consumer);
                 if (outcome.kind() == OutcomeKind.CANCELLED) {
                     // 客户端已断开：取消已完成，直接结束本次请求（不换候选、不发错误）
                     metrics.streamCancelled(request.model(), candidate.instanceId());
@@ -136,7 +133,13 @@ public class StreamProxy {
                 if (outcome.kind() == OutcomeKind.SUCCESS) {
                     recordOutcome(candidate, true, elapsedMs(start), null, policies);
                     metrics.success(request.model(), candidate.instanceId());
-                    metering.onFinish(usageOrApproximate(candidate, request));
+                    try {
+                        metering.onFinish(meteringCtx(requestId, candidate, request, metadata),
+                                usageOrApproximate(candidate, request), true);
+                    } catch (Exception e) {
+                        // 计量结算异常必须吞掉：计量是附加能力，不能反过来打断转发（与 onChunk 同语义）
+                        log.warn("[requestId={}] 计量结算异常（忽略）: {}", requestId, e.toString());
+                    }
                     return;
                 }
 
@@ -145,6 +148,14 @@ public class StreamProxy {
                 recordOutcome(candidate, false, elapsedMs(start), lastFailure, policies);
                 metrics.failure(request.model(), candidate.instanceId());
                 if (started[0]) {
+                    // 已发过 chunk：释放计量 tracker 并留失败痕迹（不扣预算，TokenMeter 处理）
+                    try {
+                        metering.onFinish(meteringCtx(requestId, candidate, request, metadata),
+                                null, false);
+                    } catch (Exception e) {
+                        // 计量异常必须吞掉（与 onChunk 同语义），不阻断 stream_interrupted 错误返回
+                        log.warn("[requestId={}] 计量结算异常（忽略）: {}", requestId, e.toString());
+                    }
                     // ⚠️ 安全边界：首字节后绝不重试/降级（客户端已收到部分内容）
                     throw new GatewayException(502, "stream_interrupted",
                             "流式输出中断: " + lastFailure.reason());
@@ -158,9 +169,11 @@ public class StreamProxy {
         }
 
         if (!attempted) {
-            String type = skippedByCircuit ? "circuit_open" : "cooldown_active";
+            String type = skippedByCircuit && skippedByCooldown ? "circuit_open_and_cooldown"
+                    : skippedByCircuit ? "circuit_open" : "cooldown_active";
             throw new GatewayException(503, type,
-                    "所有候选均被" + (skippedByCircuit ? "熔断" : "冷却") + "剔除，未发起上游调用");
+                    "所有候选均被剔除，未发起上游调用（熔断=" + skippedByCircuit
+                            + " 冷却=" + skippedByCooldown + "）");
         }
         throw mapFinalFailure(lastFailure, guard);
     }
@@ -168,13 +181,15 @@ public class StreamProxy {
     /** 单个候选的流式调用：连接器负责超时/取消，本层负责规范化与断连识别 */
     private StreamOutcome streamOnce(ModelInstance candidate, ChatRequest request,
                                      ExecutionPolicies policies, String requestId,
+                                     Map<String, String> metadata,
                                      boolean[] started, Consumer<ChatChunk> consumer) {
          StreamState state = new StreamState(candidate.model());
         try (StreamSession session = connector.stream(candidate, request, policies, chunk -> {
             ChatChunk normalized = normalize(chunk, state);
             if (!started[0]) started[0] = true;
             try {
-                metering.onChunk(normalized);      // 计量回调：失败不影响转发
+                metering.onChunk(meteringCtx(requestId, candidate, request, metadata),
+                        normalized);              // 计量回调：失败不影响转发
             } catch (Exception e) {
                 // 计量异常必须吞掉：计量是附加能力，不能反过来打断转发
                 log.warn("[requestId={}] 计量回调异常（忽略）: {}", requestId, e.toString());
@@ -197,19 +212,24 @@ public class StreamProxy {
         if (raw.id() != null) state.id(raw.id());
         if (raw.created() != 0) state.created(raw.created());
         if (raw.model() != null) state.model(raw.model());
-        if (raw.usage() != null) state.usage(raw.usage());
         return new ChatChunk(
                 raw.id() != null ? raw.id() : state.id(),
                 "chat.completion.chunk",                    // object 固定规范化
                 raw.created() != 0 ? raw.created() : state.created(),
                 raw.model() != null ? raw.model() : state.model(),
                 raw.choices(),
-                raw.usage() != null ? raw.usage() : null,
+                raw.usage(),                                 // usage 只在结束 chunk 出现，原样透传（无需复用）
                 raw.error());
     }
 
     private void recordOutcome(ModelInstance candidate, boolean success, long latencyMs,
                                Failure failure, ExecutionPolicies policies) {
+        // CANCELLED 不是失败：不进熔断窗口、不记冷却、不发失败事件
+        // （防御：当前调用路径客户端断开走 ClientDisconnectedException 不经过这里，
+        //   未来外部主动 cancel 也按同一语义处理）
+        if (!success && failure.type() == FailureType.CANCELLED) {
+            return;
+        }
         long slowThreshold = policies.circuitBreaker().slowCallThresholdMs();
         boolean slow = latencyMs >= slowThreshold;
         circuitBreakers.recordResult(candidate.instanceId(), success, latencyMs, slowThreshold);
@@ -228,6 +248,13 @@ public class StreamProxy {
     /** usage 缺失时的近似值（V4 细化真实计量） */
     private ChatCompletion.Usage usageOrApproximate(ModelInstance candidate, ChatRequest request) {
         return new ChatCompletion.Usage(0, 0, 0); // V4 用估算公式替换
+    }
+
+    /** 计量上下文（V4）：携带实际执行候选与令牌 ID，供 TokenMeter 增量累计与结算 */
+    private static MeteringContext meteringCtx(String requestId, ModelInstance candidate,
+                                               ChatRequest request, Map<String, String> metadata) {
+        return new MeteringContext(requestId, candidate, request,
+                metadata.getOrDefault("x-gateway-token-id", ""));
     }
 
     private GatewayException mapFinalFailure(Failure failure, TimeoutGuard guard) {

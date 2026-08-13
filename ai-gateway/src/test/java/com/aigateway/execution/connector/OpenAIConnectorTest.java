@@ -14,7 +14,6 @@ import com.aigateway.infra.http.HttpClientFactory;
 import com.aigateway.observability.GatewayMetrics;
 import com.aigateway.state.registry.ModelRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -40,10 +39,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * 连接器单测（V3 版）：SSE 逐行解析 + 超时参数化 + 结构化失败分类。
- *
- * ⚠️ stream 用例在 H2 手敲前 @Disabled：连接器内部 new TimeoutGuard(...) 后调用
- * scheduleOnce 会抛 TODO 异常（计划预期的"未完成前直接报错"），H2 完成后启用即可。
- * complete 用例不依赖 TimeoutGuard，已完整覆盖。
+ * 非流式与流式用例均已启用（TimeoutGuard 已实现，H2 完成）。
  */
 class OpenAIConnectorTest {
 
@@ -88,13 +84,14 @@ class OpenAIConnectorTest {
         return new ByteArrayInputStream(String.join("\n\n", lines).getBytes(StandardCharsets.UTF_8));
     }
 
-    /** mock HttpClient.send 返回一个指定 statusCode + body 的响应 */
+    /** mock HttpClient.send 返回一个指定 statusCode + body 的响应（headers 为空，供非 2xx 分支解析 Retry-After） */
     @SuppressWarnings("unchecked")
     private HttpResponse<InputStream> stubStream(HttpClient client, int status, String... lines)
             throws IOException, InterruptedException {
         HttpResponse<InputStream> response = mock(HttpResponse.class);
         when(response.statusCode()).thenReturn(status);
         when(response.body()).thenReturn(sseStream(lines));
+        when(response.headers()).thenReturn(noHeaders());
         when(client.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
                 .thenReturn(response);
         return response;
@@ -168,10 +165,9 @@ class OpenAIConnectorTest {
                 });
     }
 
-    // ══ 流式（H2 手敲后启用）══
+    // ══ 流式 ══
 
     @Test
-    @Disabled("H2 未手敲：TimeoutGuard.scheduleOnce 抛 TODO 异常，H2 完成后启用本组用例")
     void stream_shouldParseDataLinesAndIgnoreGarbage() throws Exception {
         HttpClient client = mock(HttpClient.class);
         stubStream(client, 200,
@@ -190,7 +186,6 @@ class OpenAIConnectorTest {
     }
 
     @Test
-    @Disabled("H2 未手敲：同上")
     void stream_badJson_shouldThrowBadUpstreamSse() throws Exception {
         HttpClient client = mock(HttpClient.class);
         stubStream(client, 200, "data: {not json}");
@@ -206,7 +201,6 @@ class OpenAIConnectorTest {
     }
 
     @Test
-    @Disabled("H2 未手敲：同上")
     void stream_non2xx_shouldThrowUpstreamError() throws Exception {
         HttpClient client = mock(HttpClient.class);
         stubStream(client, 500, "internal error");

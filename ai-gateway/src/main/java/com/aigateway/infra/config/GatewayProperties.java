@@ -48,6 +48,9 @@ public class GatewayProperties {
     /** V2 插件挂载（按 name 匹配 SPI 实例） */
     private List<PluginDef> plugins = new ArrayList<>();
 
+    /** V4 启动种子令牌（演示用，可空；治理开启且无任何令牌时自动建演示令牌） */
+    private List<TokenSeedDef> tokens = new ArrayList<>();
+
     /** 健康检查参数定义 */
     @Data
     public static class Health {
@@ -198,5 +201,17 @@ public class GatewayProperties {
         private String scopeValue = "";            // ROUTE=别名；MODEL=instanceId
         private int order = 0;                     // 同阶段内执行顺序（数字大的先执行）
         private Map<String, Object> config = new HashMap<>(); // 插件实例配置
+    }
+
+    /** V4 启动种子令牌定义（对照《版本4-详细实施计划》5.1 的 tokens 段） */
+    @Data
+    public static class TokenSeedDef {
+        private String name;                       // 显示名（脱敏列表用）
+        private double quotaLimit = -1;            // 额度上限（美元 / token 数；-1 = 无限）
+        private String quotaType = "COST";         // COST / TOKEN
+        private String modelScope = "";            // 逗号分隔的 alias 列表；空 = 不限
+        private String ipWhitelist = "";           // 逗号分隔的 IP 列表；空 = 不限
+        private long expiresAt = -1;               // epoch 毫秒；-1 = 永不过期
+        private boolean enabled = true;
     }
 }

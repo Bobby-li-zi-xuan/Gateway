@@ -3,6 +3,7 @@ package com.aigateway.execution.fallback;
 import com.aigateway.api.dto.ChatCompletion;
 import com.aigateway.api.dto.ChatRequest;
 import com.aigateway.core.domain.model.ModelInstance;
+import com.aigateway.core.service.ChatGatewayService.ChatResult;
 import com.aigateway.core.exception.GatewayException;
 import com.aigateway.decision.state.ModelStateStore;
 import com.aigateway.decision.state.StateEvent;
@@ -12,6 +13,7 @@ import com.aigateway.execution.connector.OpenAIConnector;
 import com.aigateway.execution.cooldown.CooldownManager;
 import com.aigateway.execution.model.ExecutionPolicies;
 import com.aigateway.execution.model.Failure;
+import com.aigateway.execution.model.FailureType;
 import com.aigateway.execution.model.UpstreamCallException;
 import com.aigateway.execution.policy.ExecutionPolicyManager;
 import com.aigateway.execution.retry.RetryExecutor;
@@ -21,7 +23,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.sql.Time;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
@@ -72,9 +73,9 @@ public class FallbackChainExecutor {
         this.scheduler = scheduler;
     }
 
-    /** 执行完整降级链；成功返回，失败抛 GatewayException */
-    public ChatCompletion execute(List<ModelInstance> chain, ChatRequest request,
-                                  String requestId, Map<String, String> metadata) {
+    /** 执行完整降级链；成功返回（携带实际执行实例），失败抛 GatewayException */
+    public ChatResult execute(List<ModelInstance> chain, ChatRequest request,
+                              String requestId, Map<String, String> metadata) {
         if (chain.isEmpty()) {
             throw new GatewayException(503, "no_available_model",
                     "模型[" + request.model() + "] 当前没有可用实例");
@@ -122,7 +123,7 @@ public class FallbackChainExecutor {
                 recordOutcome(candidate, true, elapsedMs(start), null, policies);
                 metrics.success(request.model(), candidate.instanceId());
                 log(requestId, "执行成功", candidate.describe());
-                return result;
+                return new ChatResult(result, candidate);   // V4：携带实际执行实例（计量用）
             } catch (UpstreamCallException e) {
                 long elapsed = elapsedMs(start);
                 lastFailure = e.failure();
@@ -137,10 +138,12 @@ public class FallbackChainExecutor {
         }
 
         if (!attempted) {
-            // 全被跳过 ≠ 全失败：503 语义不同，错误体要能说清原因
-            String type = skippedByCircuit ? "circuit_open" : "cooldown_active";
+            // 全被跳过 ≠ 全失败：503 语义不同，错误体要能说清原因（两种原因都命中时合并表达）
+            String type = skippedByCircuit && skippedByCooldown ? "circuit_open_and_cooldown"
+                    : skippedByCircuit ? "circuit_open" : "cooldown_active";
             throw new GatewayException(503, type,
-                    "所有候选均被" + (skippedByCircuit ? "熔断" : "冷却") + "剔除，未发起上游调用");
+                    "所有候选均被剔除，未发起上游调用（熔断=" + skippedByCircuit
+                            + " 冷却=" + skippedByCooldown + "）");
         }
         throw mapFinalFailure(lastFailure, guard);      
     }
@@ -148,6 +151,11 @@ public class FallbackChainExecutor {
     /** 一次真实调用结束后：熔断窗口、状态管道、冷却计数全部在这里收口（单点记账） */
     private void recordOutcome(ModelInstance candidate, boolean success, long latencyMs,
                                Failure failure, ExecutionPolicies policies) {
+        // CANCELLED 不是失败：不进熔断窗口、不记冷却、不发失败事件
+        // （防御：当前调用路径不产生 CANCELLED，未来外部主动 cancel 也按同一语义处理）
+        if (!success && failure.type() == FailureType.CANCELLED) {
+            return;
+        }
         long slowThreshold = policies.circuitBreaker().slowCallThresholdMs();
         boolean slow = latencyMs >= slowThreshold;
         circuitBreakers.recordResult(candidate.instanceId(), success, latencyMs, slowThreshold);
