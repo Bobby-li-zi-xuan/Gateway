@@ -35,8 +35,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class TokenManager {
 
     private static final Logger log = LoggerFactory.getLogger(TokenManager.class);
-    /** 明文前缀：agw_ 便于日志识别与脱敏展示（agw_****） */
-    public static final String PREFIX = "agw_";
+    /** 明文前缀：htl_ 便于日志识别与脱敏展示（htl_****） */
+    public static final String PREFIX = "htl_";
 
     private final TokenDao dao;
     /** tokenHash -> ApiToken（热路径缓存；吊销时删除） */
@@ -44,7 +44,15 @@ public class TokenManager {
 
     public TokenManager(TokenDao dao) {
         this.dao = dao;
-        // TODO H1：warmup() 启动预热（dao.findAll() 全量加载进 cache，吊销过滤已由 DAO 保证）
+        warmup();
+    }
+
+    /** 启动预热：全量加载令牌到缓存 */
+    private void warmup(){
+        for(ApiToken t : dao.findAll()){
+            cache.put(t.tokenHash(), t);
+        }
+        log.info("令牌缓存预热完成，共 {} 个", cache.size());
     }
 
     /**
@@ -53,10 +61,16 @@ public class TokenManager {
      */
     public CreateResult create(String name, double quotaLimit, String quotaType,
                                String modelScope, String ipWhitelist, long expiresAt) {
-        // TODO H1：生成 id（PREFIX + randomHex(8)）与明文（PREFIX + randomHex(32)）→
-        // 构造 ApiToken（tokenHash = sha256(plain)）→ dao.insert → cache.put → 返回 CreateResult
-        throw new GatewayException(500, "not_implemented",
-                "TODO H1：令牌创建未实现（手敲 TokenManager.create）");
+        String id = PREFIX + randomHex(8);
+        String plain = PREFIX + randomHex(32);      //明文凭证
+        ApiToken token = new ApiToken(id, name, sha256(plain), quotaLimit,
+                quotaType, modelScope == null ? "" : modelScope,
+                ipWhitelist == null ? "" : ipWhitelist,
+                expiresAt, true, System.currentTimeMillis());
+        dao.insert(token);
+        cache.put(token.tokenHash(), token);
+        log.info("令牌创建 id={} name={}（明文不再可见）", id, name);
+        return new CreateResult(token, plain);
     }
 
     /** 创建结果：token 是管理对象（可查列表），plain 是唯一一次明文 */
@@ -67,15 +81,37 @@ public class TokenManager {
      * 模型范围与额度预检由调用方（GovernanceService）基于返回结果继续。
      */
     public TokenStatus validate(String plainToken, String clientIp) {
-        // TODO H1：取令牌 → sha256 → 查缓存（未命中兜底 dao.findByHash）→
+        // 取令牌 → sha256 → 查缓存（未命中兜底 dao.findByHash）→
         // 逐条核对 enabled / expiresAt / IP 白名单 → 返回 TokenStatus
         // （校验失败不写缓存，防脏条目；令牌不存在返回 UNKNOWN）
-        throw new GatewayException(500, "not_implemented",
-                "TODO H1：令牌校验未实现（手敲 TokenManager.validate）");
+        if(plainToken == null || plainToken.isBlank()){
+            return TokenStatus.MISSING;
+        }
+        String hash = sha256(plainToken.trim());
+        ApiToken t = cache.get(hash);
+        if(t == null){
+            // 缓存未命中兜底查库：仍然没有 -> 不存在
+            t = dao.findByHash(hash);
+            if(t == null){
+                return TokenStatus.UNKNOWN;
+            }
+            cache.put(hash, t);
+        }
+        if(!t.enabled()){
+            return TokenStatus.DISABLED;
+        }
+        if(t.expiresAt() >= 0 && System.currentTimeMillis() > t.expiresAt()){
+            return TokenStatus.EXPIRED;
+        }
+        if(!ipAllowed(t, clientIp)){
+            return TokenStatus.IP_DENIED;
+        }
+        return TokenStatus.VALID;
     }
 
+
     /**
-     * 脚手架补充（14.1）：校验通过则返回令牌对象（GovernanceFilter 构造限流 key 用）。
+     * 校验通过则返回令牌对象（GovernanceFilter 构造限流 key 用）。
      * 内部复用 validate 的状态检查，避免两处校验逻辑漂移。
      */
     public Optional<ApiToken> resolve(String plainToken, String clientIp) {
@@ -91,10 +127,14 @@ public class TokenManager {
 
     /** 吊销：删缓存 + 库标记（在途请求不追溯） */
     public void revoke(String tokenId) {
-        // TODO H1：按 id 查令牌（dao.findAll() 过滤）→ dao.revoke(id) + cache.remove(hash)；
-        // 不存在抛 GatewayException(404, "token_not_found", ...)
-        throw new GatewayException(500, "not_implemented",
-                "TODO H1：令牌吊销未实现（手敲 TokenManager.revoke）");
+        ApiToken t = dao.findAll().stream()
+                .filter(x -> x.id().equals(tokenId)).findFirst().orElse(null);
+        if (t == null) {
+            throw new GatewayException(404, "token_not_found", "令牌不存在: " + tokenId);
+        }
+        dao.revoke(tokenId);
+        cache.remove(t.tokenHash());
+        log.info("令牌吊销 id={}", tokenId);
     }
 
     /** 按管理 ID 查令牌（管理端点/脱敏列表用） */

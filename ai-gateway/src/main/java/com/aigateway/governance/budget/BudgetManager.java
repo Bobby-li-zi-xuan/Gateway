@@ -16,7 +16,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 预算管理器：管「总量」的第二层治理（🖊 H3：逻辑全部手敲，对照 10.2 / 学习版 4.6）。
+ * 预算管理器：管「总量」的第二层治理
  *
  * 设计语义：
  * 1. 内存预算对象是热路径（预检 / 扣减 O(1)），DB 的 used_value 是慢路径对账快照
@@ -28,15 +28,6 @@ import java.util.concurrent.ConcurrentHashMap;
  * 5. 超额动作（REJECT / DEGRADE）由调用方按 exceedAction 配置执行，
  *    本类只回报 ConsumeResult 与预检结果。
  *
- * TODO H3 手敲清单（未完成前调用对应功能会直接报错）：
- * - loadFromDb()       ：启动加载 DB 预算定义 + used 快照；
- * - upsert()           ：创建/覆盖预算定义（limit <= 0 抛 invalid_request）；
- * - precheck()         ：预检剩余额度（不改变任何状态）；
- * - remainingRatio()   ：剩余比率（Scorer 信号输入）；
- * - consume()          ：结算扣减（锁内比较后写，不超扣）；失败返回 exceeded；
- * - checkWarnings()    ：跨过第 i 档阈值才记一次预警（日志 + 指标）；
- * - lazyResetIfNeeded()：周期切换的惰性重置（必须在 synchronized 内）；
- * - flushUsed()        ：对账落库（UsageLedger 定时触发）。
  */
 @Component
 public class BudgetManager {
@@ -56,16 +47,30 @@ public class BudgetManager {
         this.dao = dao;
         this.warnRatios = warnRatios.stream().sorted().toList();
         this.metrics = metrics;
-        // TODO H3：loadFromDb() 启动加载（dao.findAll() → budgets.put）
+        loadFromDb();
+    }
+
+    /** 启动加载：DB 里的预算定义 + used 快照（丢掉的未对账窗口是已知取舍） */
+    private void loadFromDb() {
+        for (Budget b : dao.findAll()) {
+            budgets.put(new BudgetKey(b.scope(), b.scopeValue()), b);
+        }
+        log.info("预算加载完成，共 {} 条", budgets.size());
     }
 
     /** 创建或替换一个预算定义（管理端点调用；同 key 覆盖） */
     public Budget upsert(BudgetScope scope, String scopeValue, LimitType limitType,
                          BudgetPeriod period, double limit) {
-        // TODO H3：limit <= 0 抛 GatewayException(400, "invalid_request")；
-        // new Budget(...) → budgets.put → warnedLevel 归零 → dao.upsert → 返回
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：预算定义未实现（手敲 BudgetManager.upsert）");
+        if(limit <= 0){
+            throw new GatewayException(400, "invalid_request", "预算上限必须 > 0");
+        }
+        Budget b = new Budget(scope, scopeValue, limitType, period, limit);
+        budgets.put(new BudgetKey(scope, scopeValue), b);
+        warnedLevel.put(new BudgetKey(scope, scopeValue), 0);
+        dao.upsert(b);
+        log.info("预算设置 scope={} value={} type={} period={} limit={}",
+                scope, scopeValue, limitType, period, limit);
+        return b;
     }
 
     /**
@@ -77,17 +82,24 @@ public class BudgetManager {
      */
     public boolean precheck(BudgetScope scope, String scopeValue,
                             long tokenAmount, double costAmount) {
-        // TODO H3：取预算（未配置 = 不限返回 true）→ synchronized → lazyReset →
-        // 整数比较 usedMicro + unit <= limitUnit
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：预算预检未实现（手敲 BudgetManager.precheck）");
+        Budget b = budgets.get(new BudgetKey(scope, scopeValue));
+        if(b == null) return true;
+        synchronized(b){
+            lazyResetIfNeeded(b);
+            long unit = b.toUnit(b.limitType() == LimitType.TOKEN ? tokenAmount : costAmount);
+            long limitUnit = b.toUnit(b.limit());
+            return b.usedMicro().get() + unit <= limitUnit;
+        }
     }
 
     /** 剩余比率（Scorer 的 budget_remaining_ratio 信号输入）；未配置预算返回 1.0 */
     public double remainingRatio(BudgetScope scope, String scopeValue) {
-        // TODO H3：取预算（未配置返回 1.0）→ synchronized → lazyReset → b.remainingRatio()
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：剩余比率未实现（手敲 BudgetManager.remainingRatio）");
+        Budget b = budgets.get(new BudgetKey(scope, scopeValue));
+        if(b == null) return 1.0;
+        synchronized(b){
+            lazyResetIfNeeded(b);
+            return b.remainingRatio();
+        }
     }
 
     /**
@@ -97,11 +109,20 @@ public class BudgetManager {
      */
     public ConsumeResult consume(BudgetScope scope, String scopeValue,
                                  long tokenAmount, double costAmount) {
-        // TODO H3：取预算（未配置 = 不扣返回 ok(1.0)）→ synchronized → lazyReset →
-        // 锁内「used + unit > limitUnit 则 exceeded；否则 set(used + unit)」→
-        // 锁外 checkWarnings → ok(remainingRatio)
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：预算扣减未实现（手敲 BudgetManager.consume）");
+        Budget b = budgets.get(new BudgetKey(scope, scopeValue));
+        if(b == null) return ConsumeResult.ok(1.0);
+        synchronized(b){
+            lazyResetIfNeeded(b);
+            long unit = b.toUnit(b.limitType() == LimitType.TOKEN ? tokenAmount : costAmount);
+            long limitUnit = b.toUnit(b.limit());
+            long used = b.usedMicro().get();
+            if(used + unit > limitUnit){
+                return ConsumeResult.exceeded(b.remainingRatio());
+            }
+            b.usedMicro().set(used + unit);
+        }
+        checkWarnings(scope, scopeValue, b);
+        return ConsumeResult.ok(b.remainingRatio());
     }
 
     /** 扣减结果：remainingRatio 供上层写信号/指标 */
@@ -112,23 +133,39 @@ public class BudgetManager {
 
     /** 预警：跨过第 i 档阈值（70% / 90%）才记一次（避免每请求重复刷日志） */
     private void checkWarnings(BudgetScope scope, String scopeValue, Budget b) {
-        // TODO H3：计算 usedRatio；从当前档位起逐档检查，跨过新档 → 记日志 + metrics.budgetWarning
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：预算预警未实现（手敲 BudgetManager.checkWarnings）");
+         double ratio = b.remainingRatio();
+        double usedRatio = 1 - ratio;
+        BudgetKey key = new BudgetKey(scope, scopeValue);
+        int level = warnedLevel.getOrDefault(key, 0);
+        int next = 0;
+        for (int i = level; i < warnRatios.size(); i++) {
+            if (usedRatio >= warnRatios.get(i)) next = i + 1;
+        }
+        if (next > level) {
+            warnedLevel.put(key, next);
+            // 软预算：只记录，不阻断（学习版 4.6 预警语义）
+            log.warn("预算预警 scope={} value={} 已用 {}%（上限 {}）",
+                    scope, scopeValue, Math.round(usedRatio * 100), b.limit());
+            metrics.budgetWarning(scope.name(), scopeValue);
+        }
     }
 
     /** 周期切换的惰性重置：读写预算前调用（必须在 synchronized 内） */
     private static void lazyResetIfNeeded(Budget b) {
-        // TODO H3：periodChanged(now) 命中 → b.resetPeriod(b.period().periodId(now))
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：周期惰性重置未实现（手敲 BudgetManager.lazyResetIfNeeded）");
+        if (b.periodChanged(System.currentTimeMillis())) {
+            b.resetPeriod(b.period().periodId(System.currentTimeMillis()));
+        }
     }
 
     /** 对账落库：把内存 used 快照写回 DB（由 UsageLedger 定时 flush 触发） */
     public void flushUsed() {
-        // TODO H3：逐预算 synchronized → lazyReset → dao.updateUsed(...)
-        throw new GatewayException(500, "not_implemented",
-                "TODO H3：预算对账落库未实现（手敲 BudgetManager.flushUsed）");
+         for (Map.Entry<BudgetKey, Budget> e : budgets.entrySet()) {
+            Budget b = e.getValue();
+            synchronized (b) {
+                lazyResetIfNeeded(b);
+                dao.updateUsed(b.scope(), b.scopeValue(), b.limitType(), b.period(), b.used());
+            }
+        }
     }
 
     /** 全部预算（管理端点列表用） */

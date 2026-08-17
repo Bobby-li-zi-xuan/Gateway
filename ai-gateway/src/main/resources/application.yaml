@@ -3,8 +3,7 @@ server:
 
 spring:
   config:
-    import:
-      - classpath:model.yml
+
   threads:
     virtual:
       enabled: true
@@ -19,3 +18,8 @@ management:
     web:
       exposure:
         include: health, prometheus
+
+gateway:
+  config:                 # 加载器参数（不属于配置快照）
+    path: classpath:gateway.yaml
+    historySize: 5        # 配置历史版本保留数（回滚范围）

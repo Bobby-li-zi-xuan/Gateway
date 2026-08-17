@@ -211,6 +211,12 @@ public class GovernanceService {
         RateLimitRule rule = new RateLimitRule(RateLimitKey.token(token.id()),
                 TimeUnit.SECONDS.toMillis(1),
                 props.getRateLimit().getTokenRate().getPerSecondTokens(), true);
+        // 单请求预估已超窗口上限：窗口和 ≥ 0，无论窗口多空都必然拒绝（退避无用）；
+        // 放行会直接撑爆“窗口总和 ≤ limit”不变量 → 413 不可重试（见 17.2）
+        if (est > rule.limit()) {
+            throw new GatewayException(413, "request_too_large",
+                    "单请求预估输入 " + est + " token 超过 Token 速率上限 " + rule.limit());
+        }
         if (!rateLimiter.tryAcquire(rule, est)) {
             metrics.rateLimited("token_rate");
             throw new GatewayException(429, "rate_limit_exceeded", "Token 速率超限");

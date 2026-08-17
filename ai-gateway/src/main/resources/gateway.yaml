@@ -9,6 +9,8 @@
 # - gateway.tokens：启动种子令牌（演示用，可空；无令牌时自动创建演示令牌）
 # - plugins 追加 governance-bootstrap（BEFORE_DECISION 写治理信号，order=100 最先执行）
 gateway:
+  include:
+    - channels.yaml             # 拆分配置
   health:
     intervalSeconds: 5
     timeoutMs: 2000
@@ -70,6 +72,12 @@ gateway:
     budget:                     # 配额（管总量）
       warnRatios: [ 0.7, 0.9 ]  # 预警阈值（软预算，不阻断）
       exceedAction: REJECT      # 超额动作：REJECT（拒绝）/ DEGRADE（降级到低成本候选）
+      defs:                     # 配置定义的预算；热更新更新上限、已用量保留
+        - scope: MODEL          # MODEL/CHANNEL/GLOBAL
+          scopeValue: qwen-large
+          limitType: COST       # TOKEN / COST
+          period: DAILY         # HOURLY / DAILY / MONTHLY
+          limit: 1.0            #上限
     usageFlush:                 # 用量批量落库
       intervalMs: 5000          # 定时 flush 周期
       batchSize: 100            # 单批最大条数（达到即刷）
@@ -80,11 +88,12 @@ gateway:
       baseUrl: http://localhost:8001
       credentialsRef: ""          # 空表示无需密钥（mock）；真实上游写 env:OPENAI_API_KEY
       weight: 10
-      timeout:                   # V3 可选：渠道级覆盖；不配则用 defaultTimeout
-        connectMs: 500
-        requestMs: 30000
-        firstByteMs: 8000
-        idleMs: 20000
+      enabled: true               # 渠道启停开关（热更新即时生效）
+      # timeout:                   # V3 可选：渠道级覆盖；不配则用 defaultTimeout
+      #   connectMs: 500
+      #   requestMs: 30000
+      #   firstByteMs: 8000
+      #   idleMs: 20000
     - id: mock-b
       provider: openai-compatible
       baseUrl: http://localhost:8002
@@ -190,6 +199,10 @@ gateway:
       scope: GLOBAL
       order: 100                 # 数字大先执行：信号要赶在过滤器读信号之前
       config: {}
+    - name: clear-candidates      # enabled开关
+      scope: GLOBAL
+      order: 10
+      enabled: false             # false = 不挂载
 
   tokens:                        # ── V4 新增：启动种子令牌（演示用，可空）──
     - name: demo
@@ -199,3 +212,8 @@ gateway:
       ipWhitelist: ""            # 空 = 不限；逗号分隔的 IP 列表
       expiresAt: -1              # epoch 毫秒；-1 = 永不过期
       enabled: true
+  
+  admin:
+    name: admin                  # 审计李的操作者名称
+    apiKey: env:ADMIN_KEY        # 管理密钥：env：引用或者明文；未配置：自动生成随机密钥并打印日志
+    ipWhitelist: []              # 空= 不限： 否则都好分割的IP列表（精确匹配，不支持CIDR）

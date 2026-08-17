@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
- * Token 计量器：把一次请求的真实/近似用量换算成 MeteredUsage（收银机，🖊 H4 核心手敲，对照 11.3）。
+ * Token 计量器：把一次请求的真实/近似用量换算成 MeteredUsage
  *
  * 两种入口：
  * - meterNonStream：非流式，响应后一次性计量（usage 优先，缺失近似）；
@@ -26,8 +26,7 @@ import java.util.stream.Collectors;
  * 误差说明（学习版 4.5 / 验收 2）：近似算法按字符数与语言系数估算，
  * 中文约 1 字/token、英文约 4 字符/token；流式输出按 chunk 文本增量累计，
  * 结束 chunk 的 usage（mock 与多数真实上游会带）优先，误差 < 15% 达标。
- *
- * TODO H4 手敲清单（未完成前调用对应功能会直接报错）：
+
  * - meterNonStream()：usage 三字段齐全则用真实值，否则近似补齐；
  * - onChunk() / onFinish()：流式增量累计（tracker 模式，按 requestId 索引）；
  *   结束 chunk usage 覆盖；失败请求成本归零且不写 finished；
@@ -56,40 +55,104 @@ public class TokenMeter implements MeteringCallback {
     /** 非流式计量：usage 三个字段齐全则用真实值，否则近似补齐 */
     public MeteredUsage meterNonStream(ModelInstance inst, ChatRequest request,
                                        ChatCompletion completion) {
-        // TODO H4：completion.usage() 且 totalTokens > 0 → 用真实 prompt/completion；
+        // completion.usage() 且 totalTokens > 0 → 用真实 prompt/completion；
         // 否则 estimated=true，输入 = estimateInput(request)、输出 = estimateOutputText(responseText)
         // → new MeteredUsage(tokenIn, tokenOut, cost(inst, tokenIn, tokenOut), estimated)
-        throw new GatewayException(500, "not_implemented",
-                "TODO H4：非流式计量未实现（手敲 TokenMeter.meterNonStream）");
+        boolean estimated = false;
+        long tokenIn;
+        long tokenOut;
+        if(completion.usage() != null && completion.usage().totalTokens() > 0){
+            tokenIn = completion.usage().promptTokens();
+            tokenOut = completion.usage().completionTokens();
+        } else {
+            estimated = true;
+            tokenIn = estimateInput(request);
+            tokenOut = estimateOutputText(responseText(completion));
+        }
+
+        return new MeteredUsage(tokenIn, tokenOut, cost(inst, tokenIn, tokenOut), estimated);
     }
 
     // ── MeteringCallback：流式增量计量 ──
 
     @Override
     public void onChunk(MeteringContext ctx, ChatChunk chunk) {
-        // TODO H4：computeIfAbsent 建 tracker（按 requestId）→ tracker.accumulate(chunk)
-        throw new GatewayException(500, "not_implemented",
-                "TODO H4：流式增量累计未实现（手敲 TokenMeter.onChunk）");
+        // computeIfAbsent 建 tracker（按 requestId）→ tracker.accumulate(chunk)
+        StreamTracker tracker = trackers.computeIfAbsent(ctx.requestId(), k -> new StreamTracker(ctx));
+        tracker.accumulate(chunk);          // 增量累计 + 结束chunk usage 覆盖
     }
 
     @Override
     public MeteredUsage onFinish(MeteringContext ctx, ChatCompletion.Usage usage, boolean success) {
-        // TODO H4：remove tracker → usage 真实值覆盖累计 → 失败请求成本归零（不写 finished）→
+        // remove tracker → usage 真实值覆盖累计 → 失败请求成本归零（不写 finished）→
         // 成功请求 finished.put(requestId, result)；tracker 缺失时按文本估算兜底
-        throw new GatewayException(500, "not_implemented",
-                "TODO H4：流式结算未实现（手敲 TokenMeter.onFinish）");
+        StreamTracker tracker = trackers.remove(ctx.requestId());
+        MeteredResult result;
+        if(tracker == null){
+            // 异常路径兜底：按请求文本估算输入，输出0（失败请求不扣预算，仅留痕）
+            long in = estimateInput(ctx.request());
+            result = new MeteredResult(ctx.instance(), new MeteredUsage(in, 0, cost(ctx.instance(), in, 0), true));
+        }else{
+            if(usage != null && usage.totalTokens() > 0){
+                // 真实 usage覆盖累计值
+                tracker.applyFinalUsage(usage);
+            }
+            MeteredUsage u = tracker.result(ctx.instance());
+            if(!success){
+                // 失败请求：仍留痕(result=failure),但不扣预算(成本归零)
+                u = new MeteredUsage(u.tokenIn(), u.tokenOut(), 0, u.estimated());
+            }
+            // 真实候选实例
+            result = new MeteredResult(ctx.instance(), u);
+        }
+        if(success){
+            finished.put(ctx.requestId(), result);
+        }
+        // 失败请求不写finished: catch 路径只留痕不结算
+        return result.usage();
     }
 
     /** 流结束后取最终计量结果（从 finished 移除；无则用 fallback 实例按文本估算兜底） */
     public MeteredResult takeResult(String requestId, ModelInstance fallback, ChatRequest request) {
-        // TODO H4：finished.remove(requestId)；无则按输入估算 + 输出 0 兜底
-        throw new GatewayException(500, "not_implemented",
-                "TODO H4：计量结果取回未实现（手敲 TokenMeter.takeResult）");
+        // finished.remove(requestId)；无则按输入估算 + 输出 0 兜底
+        MeteredResult result = finished.remove(requestId);
+        if(result == null){
+            long in = estimateInput(request);
+            result = new MeteredResult(fallback, new MeteredUsage(in, 0, cost(fallback, in, 0), true));
+        }
+        return result;
     }
 
-    /** 流式累计器：一个请求一个实例（按 requestId 索引）；TODO H4：accumulate / applyFinalUsage / result */
+    /** 流式累计器：一个请求一个实例（按 requestId 索引）；
+     * accumulate / applyFinalUsage / result */
     private final class StreamTracker {
-        StreamTracker(MeteringContext ctx) { /* TODO H4：保存 ctx 与累计状态 */ }
+        private final MeteringContext ctx;
+        private long tokenOut;
+        private boolean hasRealUsage;
+
+        StreamTracker(MeteringContext ctx) { this.ctx = ctx; }
+
+        void accumulate(ChatChunk chunk) {
+            if (chunk.choices() == null) return;
+            for (ChatChunk.ChunkChoice choice : chunk.choices()) {
+                if (choice.delta() != null && choice.delta().content() != null
+                        && !choice.delta().content().isEmpty()) {
+                    tokenOut += TokenEstimator.estimateTextTokens(
+                            choice.delta().content(), charsPerToken, cjkTokenPerChar);
+                }
+            }
+        }
+
+        void applyFinalUsage(ChatCompletion.Usage usage) {
+            tokenOut = usage.completionTokens();       // 真实值覆盖近似累计
+            hasRealUsage = true;
+        }
+
+        MeteredUsage result(ModelInstance inst) {
+            long in = estimateInput(ctx.request());
+            return new MeteredUsage(in, tokenOut,
+                    cost(inst, in, tokenOut), !hasRealUsage);
+        }
     }
 
     /** 成本核算：单价表（每 1K tokens）× 实际用量 */

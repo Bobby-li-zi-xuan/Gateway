@@ -2,6 +2,7 @@ package com.aigateway.governance.ratelimit;
 
 import org.springframework.stereotype.Component;
 
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -55,10 +56,21 @@ public class RateLimiter {
      * @return true 放行；false 超限（调用方回 429）
      */
     public boolean tryAcquire(RateLimitRule rule, long cost) {
-        // TODO H2：computeIfAbsent 建桶 → synchronized(bucket) → slide 滑窗 →
-        // windowSum + cost > limit 则拒绝（不计入窗口）→ 否则当前槽累加并放行
-        throw new com.aigateway.core.exception.GatewayException(500, "not_implemented",
-                "TODO H2：限流器未实现（手敲 RateLimiter.tryAcquire）");
+        Bucket bucket = buckets.computeIfAbsent(
+                new BucketKey(rule.key(), rule.windowMs()),
+                k -> new Bucket(rule.windowMs(), rule.limit()));
+        synchronized(bucket){
+            slide(bucket, System.currentTimeMillis());
+            // cost超过窗口直接快速失败
+            if(cost > bucket.limit) return false;
+
+            long sum = bucket.windowSum();
+            if(sum + cost > bucket.limit){
+                return false;
+            }
+            bucket.counts[bucket.currentSlot] += cost;
+            return true;
+        }      
     }
 
     /**
@@ -66,24 +78,48 @@ public class RateLimiter {
      * delta 为负 = 实际少于预估（占位过多，回吐）；为正 = 实际超出预估（补记）。
      */
     public void adjust(RateLimitKey key, long windowMs, long delta) {
-        // TODO H2：按 key+windowMs 取桶（无则直接返回）→ synchronized → slide →
-        // 只修正当前槽（跨槽误差在窗口尺度上自动弥合）
-        throw new com.aigateway.core.exception.GatewayException(500, "not_implemented",
-                "TODO H2：限流器修正未实现（手敲 RateLimiter.adjust）");
+        Bucket bucket = buckets.get(new BucketKey(key, windowMs));
+        if(bucket == null) return;
+
+        synchronized(bucket){
+            slide(bucket, System.currentTimeMillis());
+            // 只修正当前槽，跨槽误差在窗口尺度上自动弥合
+            bucket.counts[bucket.currentSlot] = Math.max(0,
+                    bucket.counts[bucket.currentSlot] + delta
+            );
+        }
     }
 
     /** 惰性滑窗：时间前进了 k 个子桶 → 途经槽清零，指针前移（旧样本过期） */
     private static void slide(Bucket bucket, long nowMs) {
-        // TODO H2：step = 经过的子桶数；step >= SLOTS 全清（等价新窗口），
-        // 否则只清途经槽；currentSlotStartMs 用余数校准保证多次小步滑动累计正确
-        throw new com.aigateway.core.exception.GatewayException(500, "not_implemented",
-                "TODO H2：滑动窗口未实现（手敲 RateLimiter.slide）");
+        // 时间差
+        long elapsed = nowMs - bucket.currentSlotStartMs;
+        // 滑过多少个子桶
+        long step = elapsed / (bucket.windowMs / SLOTS);
+        if(step <= 0) return;
+        if(step >= SLOTS){
+            // 一整个窗口都过去了，全部清零
+            Arrays.fill(bucket.counts, 0);
+            bucket.currentSlot = 0;
+        }else{
+            for(int i = 1; i <= step; i ++){
+                int idx = (bucket.currentSlot + i) % SLOTS;
+                bucket.counts[idx] = 0;
+            }
+            bucket.currentSlot = (int) ((bucket.currentSlot + step) % SLOTS);
+        }
+        //nowMs - 零头(从当前时刻倒退零头毫秒 = 上一个完整子桶的起点)
+        //零头:跨过完整子桶后剩下的不足一个子桶的时间
+        bucket.currentSlotStartMs = nowMs - (elapsed % (bucket.windowMs / SLOTS));
     }
 
     /** 当前窗口内的累计值（测试/指标用；线程安全：synchronized 读） */
     public long windowCount(RateLimitKey key, long windowMs) {
-        // TODO H2：取桶（无则 0）→ synchronized → slide → windowSum
-        throw new com.aigateway.core.exception.GatewayException(500, "not_implemented",
-                "TODO H2：窗口计数未实现（手敲 RateLimiter.windowCount）");
+        Bucket bucket = buckets.get(new BucketKey(key, windowMs));
+        if (bucket == null) return 0;
+        synchronized (bucket) {
+            slide(bucket, System.currentTimeMillis());
+            return bucket.windowSum();
+        }
     }
 }
